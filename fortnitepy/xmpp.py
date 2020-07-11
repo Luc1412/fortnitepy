@@ -23,6 +23,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
+from time import time
 
 import aioxmpp
 import asyncio
@@ -790,11 +791,13 @@ class XMPPClient:
                 return m.id == user_id
 
             try:
+                now = time()
                 member = await self.client.wait_for(
                     'party_member_join',
                     check=check,
-                    timeout=3
+                    timeout=10
                 )
+                print('Time: ' + str(time() - now))
             except asyncio.TimeoutError:
                 if user_id == self.client.user.id:
                     await party._leave()
