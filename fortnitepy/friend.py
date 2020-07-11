@@ -38,9 +38,6 @@ if TYPE_CHECKING:
     from .client import Client
     from .party import ClientParty
 
-# Type defs
-Datetime = datetime.datetime
-
 
 class FriendBase(UserBase):
 
@@ -90,14 +87,7 @@ class FriendBase(UserBase):
         return self._status
 
     @property
-    def direction(self) -> str:
-        """:class:`str`: The direction of the friendship. ``INBOUND`` if the friend
-        added :class:`ClientUser` else ``OUTGOING``.
-        """
-        return self._direction
-
-    @property
-    def inbound(self) -> bool:
+    def incoming(self) -> bool:
         """:class:`bool`: ``True`` if this friend was the one to send the
         friend request else ``False``.
         """
@@ -108,10 +98,10 @@ class FriendBase(UserBase):
         """:class:`bool`: ``True`` if the bot was the one to send the friend
         request else ``False``.
         """
-        return self._direction == 'OUTGOING'
+        return self._direction == 'OUTBOUND'
 
     @property
-    def created_at(self) -> Datetime:
+    def created_at(self) -> datetime.datetime:
         """:class:`datetime.datetime`: The UTC time of when the friendship was
         created.
         """
@@ -132,9 +122,9 @@ class FriendBase(UserBase):
     def get_raw(self) -> dict:
         return {
             **(super().get_raw()),
-            'status': self.status,
-            'direction': self.direction,
-            'created': self.created_at
+            'status': self._status,
+            'direction': self._direction,
+            'created': self._created_at
         }
 
 
@@ -151,13 +141,13 @@ class Friend(FriendBase):
 
     def __repr__(self) -> str:
         return ('<Friend id={0.id!r} display_name={0.display_name!r} '
-                'jid={0.jid!r}'.format(self))
+                'epicgames_account={0.epicgames_account!r}>'.format(self))
 
     def _update(self, data: dict) -> None:
         super()._update(data)
         self._favorite = data.get('favorite')
 
-    def _update_last_logout(self, dt: Datetime) -> None:
+    def _update_last_logout(self, dt: datetime.datetime) -> None:
         self._last_logout = dt
 
     def _update_summary(self, data: dict) -> None:
@@ -212,7 +202,7 @@ class Friend(FriendBase):
         return self.client.get_presence(self.id)
 
     @property
-    def last_logout(self) -> Optional[Datetime]:
+    def last_logout(self) -> Optional[datetime.datetime]:
         """:class:`datetime.datetime`: The UTC time of the last time this
         friend logged off.
         ``None`` if this friend has never logged into fortnite or because
@@ -227,7 +217,7 @@ class Friend(FriendBase):
         """:class:`Platform`: The platform the friend is currently online on.
         ``None`` if the friend is offline.
         """
-        pres = self.client.get_presence(self.id)
+        pres = self.last_presence
         if pres is not None:
             return pres.platform
 
@@ -249,12 +239,12 @@ class Friend(FriendBase):
         :class:`bool`
             ``True`` if the friend is currently online else ``False``.
         """
-        pres = self.client.get_presence(self.id)
+        pres = self.last_presence
         if pres is None:
             return False
         return pres.available
 
-    async def fetch_last_logout(self):
+    async def fetch_last_logout(self) -> Optional[datetime.datetime]:
         """|coro|
 
         Fetches the last time this friend logged out.
@@ -279,25 +269,30 @@ class Friend(FriendBase):
 
         return self.last_logout
 
-    async def fetch_mutual_friends_count(self) -> int:
+    async def fetch_mutual_friends(self) -> List['Friend']:
         """|coro|
 
-        Gets how many mutual friends the client and this friend have in common.
-
-        Returns
-        -------
-        :class:`int`
-            The number of friends you have common.
+        Fetches a list of friends you and this friend have in common.
 
         Raises
         ------
         HTTPException
             An error occured while requesting.
+
+        Returns
+        -------
+        List[:class:`Friend`]
+            A list of friends you and this friend have in common.
         """
-        data = await self.client.http.friends_get_summary()
-        for friend in data['friends']:
-            if friend['accountId'] == self.id:
-                return friend['mutual']
+        res = await self.client.http.friends_get_mutual(self.id)
+
+        mutuals = []
+        for user_id in res:
+            friend = self.client.get_friend(user_id)
+            if friend is not None:
+                mutuals.append(friend)
+
+        return mutuals
 
     async def set_nickname(self, nickname: str) -> None:
         """|coro|
@@ -329,7 +324,7 @@ class Friend(FriendBase):
                        'errors.com.epicgames.validation.validation_failed')
             if e.message_code in ignored:
                 raise ValueError('Invalid nickname')
-            e.reraise()
+            raise
         self._nickname = nickname
 
     async def remove_nickname(self) -> None:
@@ -374,7 +369,7 @@ class Friend(FriendBase):
                        'errors.com.epicgames.validation.validation_failed')
             if e.message_code in ignored:
                 raise ValueError('Invalid note')
-            e.reraise()
+            raise
         self._note = note
 
     async def remove_note(self) -> None:
@@ -455,28 +450,38 @@ class Friend(FriendBase):
             The party is full.
         HTTPException
             Something went wrong when trying to invite this friend.
+
+        Returns
+        -------
+        :class:`SentPartyInvitation`
+            Object representing the sent party invitation.
         """
-        await self.client.user.party.invite(self.id)
+        return await self.client.party.invite(self.id)
 
 
-class PendingFriend(FriendBase):
+class PendingFriendBase(FriendBase):
     """Represents a pending friend from Fortnite."""
 
     __slots__ = FriendBase.__slots__
 
-    def __init__(self, client: 'Client', data: dict) -> None:
-        super().__init__(client, data)
-
-    def __repr__(self) -> str:
-        return ('<PendingFriend id={0.id!r} display_name={0.display_name!r} '
-                'jid={0.jid!r}'.format(self))
-
     @property
-    def created_at(self) -> Datetime:
+    def created_at(self) -> datetime.datetime:
         """:class:`datetime.datetime`: The UTC time of when the request was
         created
         """
         return self._created_at
+
+
+class IncomingPendingFriend(PendingFriendBase):
+    """Represents an incoming pending friend. This means that the client
+    received the friend request."""
+
+    __slots__ = PendingFriendBase.__slots__
+
+    def __repr__(self) -> str:
+        return ('<IncomingPendingFriend id={0.id!r} '
+                'display_name={0.display_name!r} '
+                'epicgames_account={0.epicgames_account!r}>'.format(self))
 
     async def accept(self) -> Friend:
         """|coro|
@@ -505,5 +510,27 @@ class PendingFriend(FriendBase):
         ------
         HTTPException
             Something went wrong when trying to decline this request.
+        """
+        await self.client.remove_or_decline_friend(self.id)
+
+
+class OutgoingPendingFriend(PendingFriendBase):
+
+    __slots__ = PendingFriendBase.__slots__
+
+    def __repr__(self) -> str:
+        return ('<OutgoingPendingFriend id={0.id!r} '
+                'display_name={0.display_name!r} '
+                'epicgames_account={0.epicgames_account!r}>'.format(self))
+
+    async def cancel(self) -> None:
+        """|coro|
+
+        Cancel the friend request sent to this user.
+
+        Raises
+        ------
+        HTTPException
+            Something went wrong when trying to cancel this request.
         """
         await self.client.remove_or_decline_friend(self.id)

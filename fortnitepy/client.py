@@ -29,35 +29,31 @@ import asyncio
 import sys
 import signal
 import logging
-import json
 
-from bs4 import BeautifulSoup
-from OpenSSL.SSL import SysCallError
 from aioxmpp import JID
 from typing import Union, Optional, Any, Awaitable, Callable, Dict, List
 
-from .errors import (PartyError, HTTPException, PurchaseException,
-                     NotFound, Forbidden)
+from .errors import (PartyError, HTTPException, NotFound, Forbidden,
+                     DuplicateFriendship, FriendshipRequestAlreadySent)
 from .xmpp import XMPPClient
 from .http import HTTPClient
-from .user import ClientUser, User, BlockedUser
-from .friend import Friend, PendingFriend
-from .enums import PartyPrivacy, Platform, Region
+from .user import (ClientUser, User, BlockedUser, SacSearchEntryUser,
+                   ProfileSearchEntryUser)
+from .friend import Friend, IncomingPendingFriend, OutgoingPendingFriend
+from .enums import (Platform, Region, ProfileSearchPlatform,
+                    SeasonStartTimestamp, SeasonEndTimestamp)
 from .cache import Cache
-from .party import ClientParty
+from .party import (DefaultPartyConfig, DefaultPartyMemberConfig, ClientParty)
 from .stats import StatsV2
 from .store import Store
 from .news import BattleRoyaleNewsPost
 from .playlist import Playlist
 from .presence import Presence
+from .auth import RefreshTokenAuth
+from .kairos import Avatar, get_random_default_avatar
+from .typedefs import MaybeCoro, DatetimeOrTimestamp, StrOrInt
 
 log = logging.getLogger(__name__)
-
-# Type defs
-AnyCallableWithClient = Union[Callable, Awaitable]  # noqa
-AnyCallable = Union[Callable, Awaitable]
-StrOrInt = Union[str, int]
-Datetime = datetime.datetime
 
 
 # all credit for this function goes to discord.py.
@@ -100,7 +96,7 @@ def _cleanup_loop(loop: asyncio.AbstractEventLoop) -> None:
 
 async def _start_client(client: 'Client', *,
                         shutdown_on_error: bool = True,
-                        after: Optional[AnyCallableWithClient] = None
+                        after: Optional[MaybeCoro] = None
                         ) -> None:
     loop = asyncio.get_event_loop()
 
@@ -132,7 +128,12 @@ async def _start_client(client: 'Client', *,
             identifier = client.auth.identifier
 
             if shutdown_on_error:
-                raise type(e)('{0} - {1}'.format(identifier, e)) from e
+                if e.args:
+                    e.args = ('{0} - {1}'.format(identifier, e.args[0]),)
+                else:
+                    e.args = (identifier,)
+
+                raise e
             else:
                 message = ('An exception occured while running client '
                            '{0}'.format(identifier))
@@ -152,9 +153,10 @@ async def _start_client(client: 'Client', *,
 
 
 async def start_multiple(clients: List['Client'], *,
+                         gap_timeout: float = 0.2,
                          shutdown_on_error: bool = True,
-                         ready_callback: Optional[AnyCallable] = None,
-                         all_ready_callback: Optional[AnyCallable] = None
+                         ready_callback: Optional[MaybeCoro] = None,
+                         all_ready_callback: Optional[MaybeCoro] = None
                          ) -> None:
     """|coro|
 
@@ -167,12 +169,15 @@ async def start_multiple(clients: List['Client'], *,
     .. info::
 
         Due to throttling by epicgames on login, the clients are started
-        with a 0.2 second gap.
+        with a 0.2 second gap. You can change this value with the gap_timeout
+        keyword argument.
 
     Parameters
     ----------
     clients: List[:class:`Client`]
         A list of the clients you wish to start.
+    gap_timeout: :class:`float`
+        The time to sleep between starting clients. Defaults to ``0.2``.
     shutdown_on_error: :class:`bool`
         If the function should cancel all other start tasks if one of the
         tasks fails.
@@ -185,7 +190,10 @@ async def start_multiple(clients: List['Client'], *,
     Raises
     ------
     AuthException
-        An error occured when attempting to log in.
+        Raised if invalid credentials in any form was passed or some
+        other misc failure.
+    HTTPException
+        A request error occured while logging in.
     """  # noqa
     loop = asyncio.get_event_loop()
 
@@ -205,7 +213,7 @@ async def start_multiple(clients: List['Client'], *,
     asyncio.ensure_future(all_ready_callback_runner())
 
     tasks = {}
-    for client in clients:
+    for i, client in enumerate(clients, 1):
         tasks[client] = loop.create_task(_start_client(
             client,
             shutdown_on_error=shutdown_on_error,
@@ -213,7 +221,8 @@ async def start_multiple(clients: List['Client'], *,
         ))
 
         # sleeping between starting to avoid throttling
-        await asyncio.sleep(0.2)
+        if i < len(clients):
+            await asyncio.sleep(gap_timeout)
 
     log.debug('Starting all clients')
     return_when = (asyncio.FIRST_EXCEPTION
@@ -232,7 +241,7 @@ async def start_multiple(clients: List['Client'], *,
 async def close_multiple(clients: List['Client']) -> None:
     """|coro|
 
-    Closes multiple clients at the same time by calling :meth:`Client.logout()`
+    Closes multiple clients at the same time by calling :meth:`Client.close()`
     on all of them.
 
     Parameters
@@ -242,15 +251,16 @@ async def close_multiple(clients: List['Client']) -> None:
     """
     loop = asyncio.get_event_loop()
 
-    tasks = [loop.create_task(client.logout())
+    tasks = [loop.create_task(client.close())
              for client in clients if not client._closing]
     await asyncio.gather(*tasks)
 
 
 def run_multiple(clients: List['Client'], *,
+                 gap_timeout: float = 0.2,
                  shutdown_on_error: bool = True,
-                 ready_callback: Optional[AnyCallable] = None,
-                 all_ready_callback: Optional[AnyCallable] = None) -> None:
+                 ready_callback: Optional[MaybeCoro] = None,
+                 all_ready_callback: Optional[MaybeCoro] = None) -> None:
     """This function sets up a loop and then calls :func:`start_multiple()`
     for you. If you already have a running event loop, you should start
     the clients with :func:`start_multiple()`. On shutdown, all clients
@@ -262,13 +272,16 @@ def run_multiple(clients: List['Client'], *,
 
     .. info::
 
-        Due to throttling by epicgames on login, the clients are started with
-        a 0.2 second gap.
+        Due to throttling by epicgames on login, the clients are started
+        with a 0.2 second gap. You can change this value with the gap_timeout
+        keyword argument.
 
     Parameters
     ----------
     clients: List[:class:`Client`]
         A list of the clients you wish to start.
+    gap_timeout: :class:`float`
+        The time to sleep between starting clients. Defaults to ``0.2``.
     shutdown_on_error: :class:`bool`
         If the function should shut down all other start tasks gracefully if
         one of the tasks fails.
@@ -282,48 +295,77 @@ def run_multiple(clients: List['Client'], *,
     Raises
     ------
     AuthException
-        An error occured when attempting to log in.
+        Raised if invalid credentials in any form was passed or some
+        other misc failure.
+    HTTPException
+        A request error occured while logging in.
     """  # noqa
     loop = asyncio.get_event_loop()
+    _closing = False
     _stopped = False
 
-    def stopper(*args):
-        nonlocal _stopped
+    def close(*args):
+        nonlocal _closing
 
-        if not _stopped:
-            loop.stop()
-            _stopped = True
+        def stopper(*argss):
+            nonlocal _stopped
+            if not _stopped:
+                loop.stop()
+                _stopped = True
+
+        if not _closing:
+            _closing = True
+            fut = asyncio.ensure_future(close_multiple(clients))
+            fut.add_done_callback(stopper)
 
     try:
-        loop.add_signal_handler(signal.SIGINT, stopper)
-        loop.add_signal_handler(signal.SIGTERM, stopper)
+        loop.add_signal_handler(signal.SIGINT, close)
+        loop.add_signal_handler(signal.SIGTERM, close)
     except NotImplementedError:
         pass
 
     async def runner():
         await start_multiple(
             clients,
+            gap_timeout=gap_timeout,
             shutdown_on_error=shutdown_on_error,
             ready_callback=ready_callback,
             all_ready_callback=all_ready_callback,
         )
 
     future = asyncio.ensure_future(runner(), loop=loop)
-    future.add_done_callback(stopper)
+    future.add_done_callback(close)
 
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        _stopped = True
-        log.info('Terminating event loop.')
+
+        if not _stopped:
+            loop.run_until_complete(close_multiple(clients))
     finally:
-        future.remove_done_callback(stopper)
-        loop.run_until_complete(close_multiple(clients))
+        future.remove_done_callback(close)
+
         log.info('Cleaning up loop')
         _cleanup_loop(loop)
 
     if not future.cancelled():
         return future.result()
+
+
+class LockEvent(asyncio.Lock):
+    def __init__(self, loop=None):
+        super().__init__(loop=loop)
+
+        self._event = asyncio.Event()
+        self.wait = self._event.wait
+
+    async def acquire(self):
+        self._event.clear()
+        await super().acquire()
+
+    def release(self):
+        self._event.set()
+        super().release()
 
 
 class Client:
@@ -339,7 +381,7 @@ class Client:
     status: :class:`str`
         The status you want the client to send with its presence to friends.
         Defaults to: ``Battle Royale Lobby - {party playercount} / {party max playercount}``
-    platform: Optional[:class:`.Platform`]
+    platform: :class:`.Platform`
         The platform you want the client to display as its source.
         Defaults to :attr:`Platform.WINDOWS`.
     net_cl: :class:`str`
@@ -347,54 +389,15 @@ class Client:
         in official logs. Defaults to an empty string which is the recommended
         usage as of ``v0.9.0`` since you then
         won't need to update it when a new update is pushed by Fortnite.
-    default_party_config: Optional[:class:`dict`]
-        The party configuration used when creating parties.
-        Defaults to:
-
-        .. code-block:: python3
-
-            {
-                'privacy': PartyPrivacy.PUBLIC,
-                'joinability': 'OPEN',
-                'max_size': 16,
-                'sub_type': 'default',
-                'type': 'default',
-                'invite_ttl_seconds': 14400,
-                'chat_enabled': True,
-            }
-
-    default_party_member_config: List[:class:`functools.partial`]
-        A list of coroutines in the form of partials. This config will be
-        automatically equipped by the bot when joining new parties.
-
-        .. code-block:: python3
-
-            from fortnitepy import ClientPartyMember
-            from functools import partial
-
-            [
-                partial(ClientPartyMember.set_outfit, 'CID_175_Athena_Commando_M_Celestial'),
-                partial(ClientPartyMember.set_banner, icon="OtherBanner28", season_level=100)
-            ]
-
+    default_party_config: :class:`DefaultPartyConfig`
+        The party configuration used when creating parties. If not specified,
+        the client will use the default values specified in the data class.
+    default_party_member_config: :class:`DefaultPartyMemberConfig`
+        The party member configuration used when creating parties. If not specified,
+        the client will use the default values specified in the data class.
     build: :class:`str`
         The build used by Fortnite.
         Defaults to a valid but maybe outdated value.
-
-        .. note::
-
-            The build is updated with every major version but is not that
-            important to update as netCL.
-
-    engine_build: :class:`str`
-        The engine build used by Fortnite.
-        Defaults to a valid but maybe outdated value.
-
-        .. note::
-
-            The build is updated with every major version but is not that
-            important to update as netCL.
-
     os: :class:`str`
         The os version string to use in the user agent.
         Defaults to ``Windows/10.0.17134.1.768.64bit`` which is valid no
@@ -408,10 +411,12 @@ class Client:
 
     Attributes
     ----------
-    user: :class:`ClientUser`
-        The user the client is logged in as.
     loop: :class:`asyncio.AbstractEventLoop`
         The event loop that client implements.
+    user: :class:`ClientUser`
+        The user the client is logged in as.
+    party: :class:`ClientParty`
+        The party the client is currently connected to.
     """  # noqa
 
     def __init__(self, auth, *,
@@ -423,12 +428,13 @@ class Client:
         self.cache_users = cache_users
 
         self.status = kwargs.get('status', 'Battle Royale Lobby - {party_size} / {party_max_size}')  # noqa
+        self.avatar = kwargs.get('avatar', get_random_default_avatar())  # noqa
         self.platform = kwargs.get('platform', Platform.WINDOWS)
         self.net_cl = kwargs.get('net_cl', '')
         self.party_build_id = '1:1:{0.net_cl}'.format(self)
-        self.default_party_config = kwargs.get('default_party_config', {})
-        self.default_party_member_config = kwargs.get('default_party_member_config', [])  # noqa
-        self.build = kwargs.get('build', '++Fortnite+Release-11.00-CL-9603448')
+        self.default_party_config = kwargs.get('default_party_config', DefaultPartyConfig())  # noqa
+        self.default_party_member_config = kwargs.get('default_party_member_config', DefaultPartyMemberConfig())  # noqa
+        self.build = kwargs.get('build', '++Fortnite+Release-12.50-CL-13193885')  # noqa
         self.os = kwargs.get('os', 'Windows/10.0.17134.1.768.64bit')
 
         self.service_host = kwargs.get('xmpp_host', 'prod.ol.epicgames.com')
@@ -444,6 +450,7 @@ class Client:
         self.http = HTTPClient(self, connector=kwargs.get('connector'))
         self.http.add_header('Accept-Language', 'en-EN')
         self.xmpp = None
+        self.party = None
 
         self._listeners = {}
         self._events = {}
@@ -454,26 +461,27 @@ class Client:
         self._presences = Cache()
         self._ready = asyncio.Event(loop=self.loop)
         self._leave_lock = asyncio.Lock(loop=self.loop)
-        self._join_party_lock = asyncio.Lock(loop=self.loop)
+        self._join_party_lock = LockEvent(loop=self.loop)
         self._refresh_task = None
         self._start_runner_task = None
         self._closed = False
         self._closing = False
         self._restarting = False
+        self._first_start = True
+
+        self._join_confirmation = False
 
         self.setup_internal()
-        self.register_subclassed_events()
-        self.update_default_party_config(
-            kwargs.get('default_party_config')
-        )
-        self.update_default_party_member_config(
-            kwargs.get('default_party_member_config')
-        )
 
     @staticmethod
     def from_iso(iso: str) -> datetime.datetime:
-        """:class:`str`: Converts an iso formatted string to a
+        """Converts an iso formatted string to a
         :class:`datetime.datetime` object
+
+        Parameters
+        ----------
+        iso: :class:`str`:
+            The iso formatted string to convert to a datetime object.
 
         Returns
         -------
@@ -489,14 +497,39 @@ class Client:
 
     @staticmethod
     def to_iso(dt: str) -> datetime.datetime:
-        """:class:`datetime.datetime`: Converts a :class:`datetime.datetime`
+        """Converts a :class:`datetime.datetime`
         object to an iso formatted string
+
+        Parameters
+        ----------
+        dt: :class:`datetime.datetime`
+            The datetime object to convert to an iso formatted string.
 
         Returns
         -------
         :class:`str`
         """
-        return dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        iso = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
+
+        # fortnite's services expect three digit precision on millis
+        return iso[:23] + 'Z'
+
+    @property
+    def default_party_config(self) -> DefaultPartyConfig:
+        return self._default_party_config
+
+    @default_party_config.setter
+    def default_party_config(self, obj: DefaultPartyConfig) -> None:
+        obj._inject_client(self)
+        self._default_party_config = obj
+
+    @property
+    def default_party_member_config(self) -> DefaultPartyMemberConfig:
+        return self._default_party_member_config
+
+    @default_party_member_config.setter
+    def default_party_member_config(self, o: DefaultPartyMemberConfig) -> None:
+        self._default_party_member_config = o
 
     @property
     def friends(self) -> Dict[str, Friend]:
@@ -504,16 +537,19 @@ class Client:
         return self._friends._cache
 
     @property
-    def pending_friends(self) -> Dict[str, PendingFriend]:
-        """Dict[:class:`str`, :class:`PendingFriend`]: Mapping of currently
-        pending friends.
+    def pending_friends(self) -> Dict[str, Union[IncomingPendingFriend,
+                                                 OutgoingPendingFriend]]:
+        """Dict[:class:`str`, Union[:class:`IncomingPendingFriend`, 
+        :class:`OutgoingPendingFriend`]]]: Mapping of currently pending
+        friends.
 
         .. note::
 
-            Pending friends can be both inbound (pending friend sent the
+            Pending friends can be both incoming (pending friend sent the
             request to the bot) or outgoing (the bot sent the request to the
-            pending friend).
-        """
+            pending friend). You must check what kind of pending friend an
+            object is by TODO
+        """  # noqa
         return self._pending_friends._cache
 
     @property
@@ -530,96 +566,19 @@ class Client:
         """
         return self._presences._cache
 
-    async def update_net_cl(self, net_cl: str, *,
-                            leave_party: bool = True) -> None:
-        """|coro|
-
-        Parameters
-        ----------
-        net_cl: :class:`str`
-            The net_cl you want to set.
-        leave_party: :class:`bool`
-            Set to ``False`` if you don't want the bot to leave its current
-            party. Defaults to ``True`` since a party created with the old
-            net_cl won't work.
-
-        Raises
-        ------
-        HTTPException
-            An error occured while requesting to leave the party.
-        """
-        self.net_cl = net_cl
-        self.party_build_id = '1:1:{0}'.format(net_cl)
-
-        if leave_party:
-            await self.user.party.me.leave()
-
-    def update_default_party_config(self, config: dict) -> None:
-        if config is None:
-            return
-
-        if not isinstance(config, dict):
-            raise PartyError('\'config\' must be a dictionary')
-
-        _default_conf = {
-            'privacy': PartyPrivacy.PUBLIC.value,
-            'join_confirmation': False,
-            'joinability': 'OPEN',
-            'discoverability': 'ALL',
-            'max_size': 16,
-            'sub_type': 'default',
-            'type': 'DEFAULT',
-            'invite_ttl_seconds': 14400,
-            'chat_enabled': True,
-        }
-
-        try:
-            val = self.default_party_config['privacy'].value
-            self.default_party_config['privacy'] = val
-        except (KeyError, AttributeError):
-            pass
-
-        default_config = {**_default_conf, **self.default_party_config}
-        self.default_party_config = {**default_config, **config}
-
     def _check_party_confirmation(self) -> None:
-        val = ('party_member_confirm' in self._events
-               and len(self._events['party_member_confirm']) > 0)
-        self.update_default_party_config({'join_confirmation': val})
-
-    def update_default_party_member_config(self, config: list) -> None:
-        if config is None:
-            return
-
-        names = []
-        results = []
-
-        unfiltered = [*config[::-1], *self.default_party_member_config[::-1]]
-        for elem in unfiltered:
-            coro = elem.func
-            if coro.__qualname__ not in names:
-                names.append(coro.__qualname__)
-                results.append(elem)
-
-            if not (asyncio.iscoroutine(coro)
-                    or asyncio.iscoroutinefunction(coro)):
-                raise TypeError('default_party_member_config must be list of '
-                                'partials of coroutines')
-
-        self.default_party_member_config = results
-
-    def exc_handler(self, loop: asyncio.AbstractEventLoop, ctx: dict) -> None:
-        exc = ctx.get('exception')
-        message = 'Fatal read error on STARTTLS transport'
-        if not (isinstance(exc, SysCallError) and ctx['message'] == message):
-            loop.default_exception_handler(ctx)
+        k = 'party_member_confirm'
+        val = k in self._events and len(self._events[k]) > 0
+        if val != self._join_confirmation:
+            self._join_confirmation = val
+            self.default_party_config.update({'join_confirmation': val})
 
     def setup_internal(self) -> None:
         logger = logging.getLogger('aioxmpp')
         if logger.getEffectiveLevel() == 30:
             logger.setLevel(level=logging.ERROR)
 
-    def register_subclassed_events(self) -> None:
+    def register_methods(self) -> None:
         methods = [func for func in dir(self) if callable(getattr(self, func))]
         for method_name in methods:
             if method_name.startswith(self.event_prefix):
@@ -639,7 +598,10 @@ class Client:
         Raises
         ------
         AuthException
-            An error occured when attempting to log in.
+            Raised if invalid credentials in any form was passed or some
+            other misc failure.
+        HTTPException
+            A request error occured while logging in.
         """
         loop = self.loop
         _stopped = False
@@ -658,7 +620,7 @@ class Client:
                 await self.start()
             finally:
                 if not self._closing and self.is_ready():
-                    await self.logout()
+                    await self.close()
 
         try:
             loop.add_signal_handler(signal.SIGINT, stopper)
@@ -679,7 +641,7 @@ class Client:
             if not self._closing and self.is_ready():
                 log.info('Client not logged out when terminating loop. '
                          'Logging out now.')
-                loop.run_until_complete(self.logout())
+                loop.run_until_complete(self.close())
 
             log.info('Cleaning up loop')
             _cleanup_loop(loop)
@@ -709,18 +671,26 @@ class Client:
         Raises
         ------
         AuthException
-            An error occured when attempting to log in.
+            Raised if invalid credentials in any form was passed or some
+            other misc failure.
+        HTTPException
+            A request error occured while logging in.
         """
         _started_while_restarting = self._restarting
 
+        if self._first_start:
+            self.register_methods()
+            self._first_start = False
+
         self._check_party_confirmation()
 
-        self.loop.set_exception_handler(self.exc_handler)
         if self._closed:
             self.http.create_connection()
             self._closed = False
 
-        await self._login()
+        ret = await self._login()
+        if ret is False:
+            return
 
         self._set_ready()
         if dispatch_ready:
@@ -745,63 +715,17 @@ class Client:
             except asyncio.CancelledError:
                 pass
 
-    async def account_owns_fortnite(self) -> None:
-        entitlements = await self.http.entitlement_get_all()
-
-        for ent in entitlements:
-            if (ent['entitlementName'] == 'Fortnite_Free'
-                    and ent['active'] is True):
-                return True
-        return False
-
-    async def quick_purchase_fortnite(self) -> None:
-        data = await self.http.orderprocessor_quickpurchase()
-        status = data.get('quickPurchaseStatus', False)
-
-        if status == 'SUCCESS':
-            pass
-
-        elif status == 'CHECKOUT':
-            data = await self.http.launcher_website_purchase(
-                'fn',
-                '09176f4ff7564bbbb499bbe20bd6348f'
-            )
-            soup = BeautifulSoup(data, 'html.parser')
-
-            token = soup.find(id='purchaseToken')['value']
-            data = json.loads(await self.http.payment_website_order_preview(
-                token,
-                'fn',
-                '09176f4ff7564bbbb499bbe20bd6348f'
-            ))
-            if 'syncToken' not in data:
-                pass
-
-            await self.http.payment_website_confirm_order(token, data)
-
-        else:
-            raise PurchaseException(
-                'Could not purchase Fortnite. Reason: '
-                'Unknown status {0}'.format(status)
-            )
-
-        log.debug('Purchase of Fortnite successfully processed.')
-
     async def _login(self) -> None:
         log.debug('Running authenticating')
-        await self.auth._authenticate()
+        ret = await self.auth._authenticate()
+        if ret is False:
+            return False
 
         tasks = [
             self.http.account_get_by_user_id(self.auth.account_id),
             self.http.account_graphql_get_clients_external_auths(),
             self.http.account_get_external_auths_by_id(self.auth.account_id),
         ]
-
-        if self.kill_other_sessions:
-            tasks.append(self.http.account_sessions_kill(
-                'OTHERS_ACCOUNT_CLIENT_SERVICE'
-            ))
-            log.debug('Killing other sessions')
 
         data, ext_data, extra_ext_data, *_ = await asyncio.gather(*tasks)
         data['externalAuths'] = ext_data['myAccount']['externalAuths'] or []
@@ -815,9 +739,6 @@ class Client:
             await self.auth.accept_eula()
             log.debug('EULA accepted')
 
-        if not await self.account_owns_fortnite():
-            await self.quick_purchase_fortnite()
-
         await state_fut
 
         self.xmpp = XMPPClient(self)
@@ -827,34 +748,14 @@ class Client:
         await self.initialize_party()
         log.debug('Party created')
 
-    async def logout(self, *,
+    async def _close(self, *,
                      close_http: bool = True,
-                     dispatch_logout: bool = True) -> None:
-        """|coro|
-
-        Logs the user out and closes running services.
-
-        Parameters
-        ----------
-        close_http: :class:`bool`
-            Whether or not to close the clients :class:`aiohttp.ClientSession`
-            when logged out.
-        dispatch_logout: :class:`bool`
-            Whether or not to dispatch the logout event.
-
-        Raises
-        ------
-        HTTPException
-            An error occured while logging out.
-        """
+                     dispatch_close: bool = True) -> None:
         self._closing = True
 
-        if dispatch_logout:
-            await self.dispatch_and_wait_event('logout')
-
         try:
-            if self.user.party is not None:
-                await self.user.party._leave()
+            if self.party is not None:
+                await self.party._leave()
         except Exception:
             pass
 
@@ -863,10 +764,26 @@ class Client:
         except Exception:
             pass
 
-        try:
-            await self.http.account_session_kill_token(self.auth.access_token)
-        except Exception:
-            pass
+        async def killer(token):
+            if token is None:
+                return
+
+            try:
+                await self.http.account_sessions_kill_token(token)
+            except HTTPException:
+                # All exchanged sessions should be killed when the original
+                # session is killed, but this doesn't seem to be consistant.
+                # The solution is to attempt to kill each token and then just
+                # catch 401.
+                pass
+
+        if not self._restarting:
+            tasks = (
+                killer(getattr(self.auth, 'ios_access_token', None)),
+                killer(getattr(self.auth, 'launcher_access_token', None)),
+                killer(getattr(self.auth, 'access_token', None)),
+            )
+            await asyncio.gather(*tasks)
 
         self._friends.clear()
         self._pending_friends.clear()
@@ -891,7 +808,35 @@ class Client:
         self._closing = False
         log.debug('Successfully logged out')
 
-    def is_closed(self):
+    async def close(self, *,
+                    close_http: bool = True,
+                    dispatch_close: bool = True) -> None:
+        """|coro|
+
+        Logs the user out and closes running services.
+
+        Parameters
+        ----------
+        close_http: :class:`bool`
+            Whether or not to close the clients :class:`aiohttp.ClientSession`
+            when logged out.
+        dispatch_close: :class:`bool`
+            Whether or not to dispatch the close event.
+
+        Raises
+        ------
+        HTTPException
+            An error occured while logging out.
+        """
+        if dispatch_close:
+            await self.dispatch_and_wait_event('close')
+
+        await self._close(
+            close_http=close_http,
+            dispatch_close=dispatch_close
+        )
+
+    def is_closed(self) -> bool:
         """:class:`bool`: Whether the client is running or not."""
         return self._closed
 
@@ -904,14 +849,22 @@ class Client:
         Raises
         ------
         AuthException
-            An error occured while authenticating.
+            Raised if invalid credentials in any form was passed or some
+            other misc failure.
         HTTPException
-            An error occured while requesting something.
+            A request error occured while logging in.
         """
         self._restarting = True
+        ios_refresh_token = self.auth.ios_refresh_token
 
         asyncio.ensure_future(self.recover_events(), loop=self.loop)
-        await self.logout(close_http=False, dispatch_logout=False)
+        await self.close(close_http=False, dispatch_close=False)
+
+        auth = RefreshTokenAuth(
+            refresh_token=ios_refresh_token
+        )
+        auth.initialize(self)
+        self.auth = auth
 
         async def runner():
             try:
@@ -978,10 +931,15 @@ class Client:
         """
         await self._ready.wait()
 
+    def construct_party(self, data: dict, *,
+                        cls: Optional[ClientParty] = None) -> ClientParty:
+        clazz = cls or self.default_party_config.cls
+        return clazz(self, data)
+
     async def initialize_party(self) -> None:
         data = await self.http.party_lookup_user(self.user.id)
         if len(data['current']) > 0:
-            party = ClientParty(self, data['current'][0])
+            party = self.construct_party(data['current'][0])
             await party._leave()
             log.debug('Left old party')
 
@@ -1022,13 +980,13 @@ class Client:
 
         Returns
         -------
-        :class:`User`
+        Optional[:class:`User`]
             The user requested. If not found it will return ``None``.
         """
         if cache:
             for u in self._users._cache.values():
                 try:
-                    if u.display_name.lower() == display_name.lower():
+                    if u.display_name.casefold() == display_name.casefold():
                         return u
                 except AttributeError:
                     pass
@@ -1040,7 +998,7 @@ class Client:
 
         epic_accounts = [d for d in accounts if d['displayName'] is not None]
         if epic_accounts:
-            account = max(epic_accounts, key=lambda d: d['externalAuths'])
+            account = max(epic_accounts, key=lambda d: len(d['externalAuths']))
         else:
             account = accounts[0]
 
@@ -1069,6 +1027,16 @@ class Client:
         raw: :class:`bool`
             If set to True it will return the data as you would get it from
             the api request. *Defaults to ``False``*
+
+        Raises
+        ------
+        HTTPException
+            An error occured while requesting the user.
+
+        Returns
+        -------
+        List[:class:`User`]
+            A list containing all payloads found for this user.
         """
         res = await self.http.account_graphql_get_by_display_name(display_name)
         return [User(self, account) for account in res['account']]
@@ -1108,7 +1076,7 @@ class Client:
 
         Returns
         -------
-        :class:`User`
+        Optional[:class:`User`]
             The user requested. If not found it will return ``None``
         """
         try:
@@ -1162,16 +1130,17 @@ class Client:
         tasks = []
 
         def find_by_display_name(dn):
-            for u in self._users._cache.values():
-                try:
-                    if u.display_name.lower() == dn.lower():
-                        profiles.append(u)
-                        break
-                except AttributeError:
-                    pass
-            else:
-                task = self.http.account_graphql_get_by_display_name(elem)
-                tasks.append(task)
+            if cache:
+                for u in self._users._cache.values():
+                    try:
+                        if u.display_name.casefold() == dn.casefold():
+                            profiles.append(u)
+                            return
+                    except AttributeError:
+                        pass
+
+            task = self.http.account_graphql_get_by_display_name(elem)
+            tasks.append(task)
 
         for elem in users:
             if self.is_display_name(elem):
@@ -1218,6 +1187,165 @@ class Client:
                         profiles.append(u)
         return profiles
 
+    async def fetch_profile_by_email(self, email, *,
+                                     cache: bool = False,
+                                     raw: bool = False) -> Optional[User]:
+        """|coro|
+
+        Fetches a single profile by the email.
+
+        .. warning::
+
+            Because of epicgames throttling policy, you can only do this
+            request three times in a timespan of 600 seconds. If you were
+            to do more than three requests in that timespan, a
+            :exc:`HTTPException` would be raised.
+
+        Parameters
+        ----------
+        email: :class:`str`
+            The email of the account you are requesting.
+        cache: :class:`bool`
+            If set to True it will try to get the profile from the friends or
+            user cache and fall back to an api request if not found.
+
+            .. note::
+
+                This method does two api requests but with this set to False
+                only one request will be done as long as the user is found in
+                one of the caches.
+
+        raw: :class:`bool`
+            If set to True it will return the data as you would get it from
+            the api request.
+
+            .. note::
+
+                Setting raw to True does not work with cache set to True.
+
+        Raises
+        ------
+        HTTPException
+            An error occured while requesting the user.
+
+        Returns
+        -------
+        Optional[:class:`User`]
+            The user requested. If not found it will return ``None``
+        """
+        try:
+            res = await self.http.account_get_by_email(email)
+        except HTTPException as e:
+            m = 'errors.com.epicgames.account.account_not_found'
+            if e.message_code == m:
+                return None
+            raise
+
+        # Request the account data through graphql since the one above returns
+        # empty external auths payload.
+        account_id = res['id']
+        return await self.fetch_profile(account_id, cache=cache, raw=raw)
+
+    async def search_profiles(self, prefix: str,
+                              platform: ProfileSearchPlatform
+                              ) -> List[ProfileSearchEntryUser]:
+        """|coro|
+
+        Searches after profiles by a prefix and returns up to 100 matches.
+
+        Parameters
+        ----------
+        prefix: :class:`str`
+            | The prefix you want to search by. The prefix is case insensitive.
+            | Example: ``Tfue`` will return Tfue's profile + up to 99 other
+            profiles which have display names that start with or match exactly
+            to ``Tfue`` like ``Tfue_Faze dequan``.
+        platform: :class:`ProfileSearchPlatform`
+            The platform you wish to search by.
+
+            ..note::
+
+                The platform is only important for prefix matches. All exact
+                matches are returned regardless of which platform is
+                specified.
+
+        Raises
+        ------
+        HTTPException
+            An error occured while requesting.
+
+        Returns
+        -------
+        List[:class:`ProfileSearchEntryUser`]
+            An ordered list of users that matched the prefix.
+        """
+        if not isinstance(platform, ProfileSearchPlatform):
+            raise TypeError(
+                'The platform passed must be a constant from '
+                'fortnitepy.ProfileSearchPlatform'
+            )
+
+        res = await self.http.user_search_by_prefix(
+            prefix,
+            platform.value
+        )
+
+        user_ids = [d['accountId'] for d in res]
+        profiles = await self.fetch_profiles(user_ids, raw=True)
+        lookup = {p['id']: p for p in profiles}
+
+        entries = []
+        for data in res:
+            profile_data = lookup.get(data['accountId'])
+            if profile_data is None:
+                continue
+
+            obj = ProfileSearchEntryUser(self, profile_data, data)
+            entries.append(obj)
+
+        return entries
+
+    async def search_sac_by_slug(self, slug: str) -> List[SacSearchEntryUser]:
+        """|coro|
+
+        Searches for an owner of slug + retrieves owners of similar slugs.
+
+        Parameters
+        ----------
+        slug: :class:`str`
+            The slug (support a creator code) you wish to search for.
+
+        Raises
+        ------
+        HTTPException
+            An error occured while requesting fortnite's services.
+
+        Returns
+        -------
+        List[:class:`SacSearchEntryUser`]
+            An ordered list of users who matched the exact or slightly
+            modified slug.
+        """
+        res = await self.http.payment_website_search_sac_by_slug(slug)
+
+        user_ids = [e['id'] for e in res]
+        profiles = await self.fetch_profiles(
+            list(user_ids),
+            raw=True
+        )
+        lookup = {p['id']: p for p in profiles}
+
+        entries = []
+        for data in res:
+            profile_data = lookup.get(data['id'])
+            if profile_data is None:
+                continue
+
+            obj = SacSearchEntryUser(self, profile_data, data)
+            entries.append(obj)
+
+        return entries
+
     async def initialize_states(self) -> None:
         tasks = (
             self.http.friends_get_all(include_pending=True),
@@ -1232,19 +1360,19 @@ class Client:
         profiles = {profile['id']: profile for profile in profiles}
 
         for friend in raw_friends:
+            try:
+                data = profiles[friend['accountId']]
+            except KeyError:
+                continue
+
             if friend['status'] == 'ACCEPTED':
-                try:
-                    data = profiles[friend['accountId']]
-                    self.store_friend({**friend, **data})
-                except KeyError:
-                    continue
+                self.store_friend({**friend, **data})
 
             elif friend['status'] == 'PENDING':
-                try:
-                    data = profiles[friend['accountId']]
-                    self.store_pending_friend({**friend, **data})
-                except KeyError:
-                    continue
+                if friend['direction'] == 'INBOUND':
+                    self.store_incoming_pending_friend({**friend, **data})
+                else:
+                    self.store_outgoing_pending_friend({**friend, **data})
 
         for data in raw_summary['friends']:
             friend = self.get_friend(data['accountId'])
@@ -1254,8 +1382,13 @@ class Client:
         for user_id, data in raw_presences.items():
             friend = self.get_friend(user_id)
             if friend is not None:
+                try:
+                    value = data[0]['last_online']
+                except (IndexError, KeyError):
+                    value = None
+
                 friend._update_last_logout(
-                    self.from_iso(data[0]['last_online'])
+                    self.from_iso(value) if value is not None else None
                 )
 
         for data in raw_summary['blocklist']:
@@ -1336,8 +1469,9 @@ class Client:
         """
         return self._friends.get(user_id)
 
-    def store_pending_friend(self, data: dict, *,
-                             try_cache: bool = True) -> PendingFriend:
+    def store_incoming_pending_friend(self, data: dict, *,
+                                      try_cache: bool = True
+                                      ) -> IncomingPendingFriend:
         try:
             user_id = data.get(
                 'accountId',
@@ -1348,11 +1482,31 @@ class Client:
         except KeyError:
             pass
 
-        pf = PendingFriend(self, data)
+        pf = IncomingPendingFriend(self, data)
         self._pending_friends.set(pf.id, pf)
         return pf
 
-    def get_pending_friend(self, user_id: str) -> Optional[PendingFriend]:
+    def store_outgoing_pending_friend(self, data: dict, *,
+                                      try_cache: bool = True
+                                      ) -> OutgoingPendingFriend:
+        try:
+            user_id = data.get(
+                'accountId',
+                data.get('id', data.get('account_id'))
+            )
+            if try_cache:
+                return self._pending_friends.get(user_id, silent=False)
+        except KeyError:
+            pass
+
+        pf = OutgoingPendingFriend(self, data)
+        self._pending_friends.set(pf.id, pf)
+        return pf
+
+    def get_pending_friend(self,
+                           user_id: str
+                           ) -> Optional[Union[IncomingPendingFriend,
+                                               OutgoingPendingFriend]]:
         """Tries to get a pending friend from the pending friend cache by the
         given user id.
 
@@ -1363,9 +1517,10 @@ class Client:
 
         Returns
         -------
-        Optional[:class:`PendingFriend`]
+        Optional[Union[:class:`IncomingPendingFriend`, 
+        :class:`OutgoingPendingFriend`]]
             The pending friend if found, else ``None``
-        """
+        """  # noqa
         return self._pending_friends.get(user_id)
 
     def store_blocked_user(self, data: dict, *,
@@ -1553,10 +1708,43 @@ class Client:
 
         Raises
         ------
+        NotFound
+            The specified user does not exist.
+        DuplicateFriendship
+            The client is already friends with this user.
+        FriendshipRequestAlreadySent
+            The client has already sent a friendship request that has not been
+            handled yet by the user.
+        Forbidden
+            The client is not allowed to send friendship requests to the user
+            because of the users settings.
         HTTPException
             An error occured while requesting to add this friend.
         """
-        await self.http.friends_add_or_accept(user_id)
+        try:
+            await self.http.friends_add_or_accept(user_id)
+        except HTTPException as exc:
+            m = 'errors.com.epicgames.friends.account_not_found'
+            if exc.message_code == m:
+                raise NotFound('The specified account does not exist.')
+
+            m = 'errors.com.epicgames.friends.duplicate_friendship'
+            if exc.message_code == m:
+                raise DuplicateFriendship('This friendship already exists.')
+
+            m = 'errors.com.epicgames.friends.friend_request_already_sent'
+            if exc.message_code == m:
+                raise FriendshipRequestAlreadySent(
+                    'A friendship request already exists for this user.'
+                )
+
+            m = ('errors.com.epicgames.friends.'
+                 'cannot_friend_due_to_target_settings')
+            if exc.message_code == m:
+                raise Forbidden('You cannot send friendship requests to '
+                                'this user.')
+
+            raise
 
     async def accept_friend(self, user_id: str) -> Friend:
         """|coro|
@@ -1575,6 +1763,16 @@ class Client:
 
         Raises
         ------
+        NotFound
+            The specified user does not exist.
+        DuplicateFriendship
+            The client is already friends with this user.
+        FriendshipRequestAlreadySent
+            The client has already sent a friendship request that has not been
+            handled yet by the user.
+        Forbidden
+            The client is not allowed to send friendship requests to the user
+            because of the users settings.
         HTTPException
             An error occured while requesting to accept this friend.
 
@@ -1583,7 +1781,7 @@ class Client:
         :class:`Friend`
             Object of the friend you just added.
         """
-        await self.http.friends_add_or_accept(user_id)
+        await self.add_friend(user_id)
         friend = await self.wait_for('friend_add',
                                      check=lambda f: f.id == user_id)
         return friend
@@ -1605,6 +1803,19 @@ class Client:
         """
         await self.http.friends_remove_or_decline(user_id)
 
+    # NOTE: Not tested
+    async def remove_all_friends(self) -> None:
+        """|coro|
+
+        Removes all friends of the client.
+
+        Raises
+        ------
+        HTTPException
+            Something went wrong when requesting fortnite's services.
+        """
+        await self.http.friends_remove_all()
+
     async def dispatch_and_wait_event(self, event: str,
                                       *args: Any,
                                       **kwargs: Any) -> None:
@@ -1613,9 +1824,14 @@ class Client:
         if len(tasks) > 0:
             await asyncio.gather(*tasks)
 
+    def _dispatcher(self, coro: Awaitable,
+                    *args: Any,
+                    **kwargs: Any) -> asyncio.Future:
+        return asyncio.ensure_future(coro(*args, **kwargs), loop=self.loop)
+
     def dispatch_event(self, event: str,
                        *args: Any,
-                       **kwargs: Any) -> None:
+                       **kwargs: Any) -> List[asyncio.Future]:
         listeners = self._listeners.get(event)
         if listeners:
             removed = []
@@ -1645,9 +1861,13 @@ class Client:
                 for idx in reversed(removed):
                     del listeners[idx]
 
-        if event in self._events.keys():
+        tasks = []
+        if event in self._events:
             for coro in self._events[event]:
-                asyncio.ensure_future(coro(*args, **kwargs), loop=self.loop)
+                task = self._dispatcher(coro, *args, **kwargs)
+                tasks.append(task)
+
+        return tasks
 
     def wait_for(self, event: str, *,
                  check: Callable = None,
@@ -1745,6 +1965,10 @@ class Client:
         listeners.append((future, check))
         return asyncio.wait_for(future, timeout, loop=self.loop)
 
+    def _event_has_handlers(self, event: str) -> bool:
+        handlers = self._events.get(event.lower())
+        return handlers is not None and len(handlers) > 0
+
     def add_event_handler(self, event: str, coro: Awaitable[Any]) -> None:
         """Registers a coroutine as an event handler. You can register as many
         coroutines as you want to a single event.
@@ -1764,7 +1988,10 @@ class Client:
         if not asyncio.iscoroutinefunction(coro):
             raise TypeError('event registered must be a coroutine function')
 
-        if event[len(self.event_prefix):] not in self._events.keys():
+        if event.startswith(self.event_prefix):
+            event = event[len(self.event_prefix):]
+
+        if event not in self._events:
             self._events[event] = []
         self._events[event].append(coro)
 
@@ -1779,15 +2006,13 @@ class Client:
             The coroutine that already functions as a handler for the
             specified event.
         """
-        if event not in self._events.keys():
+        if event not in self._events:
             return
 
-        try:
-            self._events[event].remove(coro)
-        except ValueError:
-            pass
+        self._events[event] = [c for c in self._events[event] if c != coro]
 
-    def event(self, event_or_coro: Union[str, Awaitable[Any]]) -> Awaitable:
+    def event(self,
+              event_or_coro: Union[str, Awaitable[Any]] = None) -> Awaitable:
         """A decorator to register an event.
 
         .. note::
@@ -1814,19 +2039,25 @@ class Client:
             Event is not specified as argument or function name with event
             prefix.
         """
-        is_coro = not isinstance(event_or_coro, str)
+        is_coro = callable(event_or_coro)
 
         def pred(coro):
+            if isinstance(coro, staticmethod):
+                coro = coro.__func__
+
             if not asyncio.iscoroutinefunction(coro):
                 raise TypeError('the decorated function must be a coroutine')
 
-            if is_coro and not coro.__name__.startswith(self.event_prefix):
-                raise TypeError('non specified events must follow '
-                                'this function name format: '
-                                '"{}<event>"'.format(self.event_prefix))
+            if is_coro or event_or_coro is None:
+                if not coro.__name__.startswith(self.event_prefix):
+                    raise TypeError('non specified events must follow '
+                                    'this function name format: '
+                                    '"{}<event>"'.format(self.event_prefix))
 
-            name = (coro.__name__[len(self.event_prefix):]
-                    if is_coro else event_or_coro)
+                name = coro.__name__[len(self.event_prefix):]
+            else:
+                name = event_or_coro
+
             self.add_event_handler(name, coro)
             log.debug('{} has been registered as a handler for the '
                       'event {}'.format(coro.__name__, name))
@@ -1834,8 +2065,8 @@ class Client:
         return pred(event_or_coro) if is_coro else pred
 
     async def fetch_br_stats(self, user_id: str, *,
-                             start_time: Optional[Datetime] = None,
-                             end_time: Optional[Datetime] = None
+                             start_time: Optional[DatetimeOrTimestamp] = None,
+                             end_time: Optional[DatetimeOrTimestamp] = None
                              ) -> StatsV2:
         """|coro|
 
@@ -1845,13 +2076,13 @@ class Client:
         ----------
         user_id: :class:`str`
             The id of the user you want to fetch stats for.
-        start_time: Optional[Union[:class:`int`, :class:`datetime.datetime`]]
+        start_time: Optional[Union[:class:`int`, :class:`datetime.datetime`, :class:`SeasonStartTimestamp`]]
             The UTC start time of the time period to get stats from.
-            *Must be seconds since epoch or :class:`datetime.datetime`*
+            *Must be seconds since epoch, :class:`datetime.datetime` or a constant from SeasonEndTimestamp*
             *Defaults to None*
-        end_time: Optional[Union[:class:`int`, :class:`datetime.datetime`]]
+        end_time: Optional[Union[:class:`int`, :class:`datetime.datetime`, :class:`SeasonEndTimestamp`]]
             The UTC end time of the time period to get stats from.
-            *Must be seconds since epoch or :class:`datetime.datetime`*
+            *Must be seconds since epoch, :class:`datetime.datetime` or a constant from SeasonEndTimestamp*
             *Defaults to None*
 
         Raises
@@ -1869,13 +2100,17 @@ class Client:
         :class:`StatsV2`
             An object representing the stats for this user. If the user was
             not found ``None`` is returned.
-        """
+        """  # noqa
         epoch = datetime.datetime.utcfromtimestamp(0)
         if isinstance(start_time, datetime.datetime):
             start_time = int((start_time - epoch).total_seconds())
+        elif isinstance(start_time, SeasonStartTimestamp):
+            start_time = start_time.value
 
         if isinstance(end_time, datetime.datetime):
             end_time = int((end_time - epoch).total_seconds())
+        elif isinstance(end_time, SeasonEndTimestamp):
+            end_time = end_time.value
 
         tasks = [
             self.fetch_profile(user_id, cache=True),
@@ -1892,9 +2127,30 @@ class Client:
 
         return StatsV2(*results) if results[0] is not None else None
 
-    async def fetch_multiple_br_stats(self, user_ids: str, stats: List[str], *,
-                                      start_time: Optional[Datetime] = None,
-                                      end_time: Optional[Datetime] = None
+    async def _multiple_stats_chunk_requester(self, user_ids: List[str],
+                                              stats: List[str],
+                                              start_time: Optional[DatetimeOrTimestamp] = None,  # noqa
+                                              end_time: Optional[DatetimeOrTimestamp] = None  # noqa
+                                              ) -> List[dict]:
+        chunks = [user_ids[i:i+51] for i in range(0, len(user_ids), 51)]
+
+        tasks = []
+        for chunk in chunks:
+            tasks.append(self.http.stats_get_mutliple_v2(
+                chunk,
+                stats,
+                start_time=start_time,
+                end_time=end_time
+            ))
+
+        results = await asyncio.gather(*tasks)
+        return [item for sub in results for item in sub]
+
+    async def fetch_multiple_br_stats(self, user_ids: List[str],
+                                      stats: List[str],
+                                      *,
+                                      start_time: Optional[DatetimeOrTimestamp] = None,  # noqa
+                                      end_time: Optional[DatetimeOrTimestamp] = None  # noqa
                                       ) -> Dict[str, StatsV2]:
         """|coro|
 
@@ -1949,13 +2205,13 @@ class Client:
                     fortnitepy.StatsV2.create_stat('matchesplayed', fortnitepy.V2Input.KEYBOARDANDMOUSE, 'defaultsolo')
                 ]
 
-        start_time: Optional[Union[:class:`int`, :class:`datetime.datetime`]]
+        start_time: Optional[Union[:class:`int`, :class:`datetime.datetime`, :class:`SeasonStartTimestamp`]]
             The UTC start time of the time period to get stats from.
-            *Must be seconds since epoch or :class:`datetime.datetime`*
+            *Must be seconds since epoch, :class:`datetime.datetime` or a constant from SeasonEndTimestamp*
             *Defaults to None*
-        end_time: Optional[Union[:class:`int`, :class:`datetime.datetime`]]
+        end_time: Optional[Union[:class:`int`, :class:`datetime.datetime`, :class:`SeasonEndTimestamp`]]
             The UTC end time of the time period to get stats from.
-            *Must be seconds since epoch or :class:`datetime.datetime`*
+            *Must be seconds since epoch, :class:`datetime.datetime` or a constant from SeasonEndTimestamp*
             *Defaults to None*
 
         Raises
@@ -1972,14 +2228,23 @@ class Client:
         """  # noqa
         epoch = datetime.datetime.utcfromtimestamp(0)
         if isinstance(start_time, datetime.datetime):
-            start_time = (start_time - epoch).total_seconds()
+            start_time = int((start_time - epoch).total_seconds())
+        elif isinstance(start_time, SeasonStartTimestamp):
+            start_time = start_time.value
 
         if isinstance(end_time, datetime.datetime):
-            end_time = (end_time - epoch).total_seconds()
+            end_time = int((end_time - epoch).total_seconds())
+        elif isinstance(end_time, SeasonEndTimestamp):
+            end_time = end_time.value
 
         tasks = [
             self.fetch_profiles(user_ids, cache=True),
-            self.http.stats_get_mutliple_v2(user_ids, stats)
+            self._multiple_stats_chunk_requester(
+                user_ids,
+                stats,
+                start_time=start_time,
+                end_time=end_time
+            )
         ]
         results = await asyncio.gather(*tasks)
         if len(results[0]) > 0 and isinstance(results[0][0], dict):
@@ -1994,7 +2259,10 @@ class Client:
         return res
 
     async def fetch_multiple_battlepass_levels(self,
-                                               users: List[str]
+                                               users: List[str],
+                                               *,
+                                               start_time: Optional[DatetimeOrTimestamp] = None,  # noqa
+                                               end_time: Optional[DatetimeOrTimestamp] = None  # noqa
                                                ) -> Dict[str, float]:
         """|coro|
 
@@ -2004,6 +2272,19 @@ class Client:
         ----------
         users: List[:class:`str`]
             List of user ids.
+        start_time: Optional[Union[:class:`int`, :class:`datetime.datetime`, :class:`SeasonStartTimestamp`]]
+            The UTC start time of the window to get the battlepass level from.
+            *Must be seconds since epoch, :class:`datetime.datetime` or a constant from SeasonEndTimestamp*
+            *Defaults to None*
+        end_time: Optional[Union[:class:`int`, :class:`datetime.datetime`, :class:`SeasonEndTimestamp`]]
+            The UTC end time of the window to get the battlepass level from.
+            *Must be seconds since epoch, :class:`datetime.datetime` or a constant from SeasonEndTimestamp*
+            *Defaults to None*
+
+        .. note::
+
+            If neither start_time nor end_time is ``None`` (default), then
+            the battlepass level from the current season is fetched.
 
         Raises
         ------
@@ -2014,23 +2295,61 @@ class Client:
         -------
         Dict[:class:`str`, :class:`float`]
             Users battlepass level mapped to their account id. Returns ``None``
-            if no battlepass level was found.
-        """
-        data = await self.http.stats_get_mutliple_v2(
+            if no battlepass level was found. If a user has career board set
+            to private, he/she will not appear in the result. Therefore you
+            should never expect a user to be included.
+        """  # noqa
+        epoch = datetime.datetime.utcfromtimestamp(0)
+        if isinstance(start_time, datetime.datetime):
+            start_time = int((start_time - epoch).total_seconds())
+        elif isinstance(start_time, SeasonStartTimestamp):
+            start_time = start_time.value
+
+        if isinstance(end_time, datetime.datetime):
+            end_time = int((end_time - epoch).total_seconds())
+        elif isinstance(end_time, SeasonEndTimestamp):
+            end_time = end_time.value
+
+        data = await self._multiple_stats_chunk_requester(
             users,
-            ('s11_social_bp_level',)
+            ('s11_social_bp_level',),
+            start_time=start_time,
+            end_time=end_time
         )
 
         return {e['accountId']: e['stats'].get('s11_social_bp_level', None)
                 for e in data}
 
-    async def fetch_battlepass_level(self, user_id: str) -> float:
+    async def fetch_battlepass_level(self, user_id: str, *,
+                                     start_time: Optional[DatetimeOrTimestamp] = None,  # noqa
+                                     end_time: Optional[DatetimeOrTimestamp] = None  # noqa
+                                     ) -> float:
         """|coro|
 
         Fetches a users battlepass level.
 
+        Parameters
+        ----------
+        user_id: :class:`str`
+            The user id to fetch the battlepass level for.
+        start_time: Optional[Union[:class:`int`, :class:`datetime.datetime`, :class:`SeasonStartTimestamp`]]
+            The UTC start time of the window to get the battlepass level from.
+            *Must be seconds since epoch, :class:`datetime.datetime` or a constant from SeasonEndTimestamp*
+            *Defaults to None*
+        end_time: Optional[Union[:class:`int`, :class:`datetime.datetime`, :class:`SeasonEndTimestamp`]]
+            The UTC end time of the window to get the battlepass level from.
+            *Must be seconds since epoch, :class:`datetime.datetime` or a constant from SeasonEndTimestamp*
+            *Defaults to None*
+
+        .. note::
+
+            If neither start_time nor end_time is ``None`` (default), then
+            the battlepass level from the current season is fetched.
+
         Raises
         ------
+        Forbidden
+            User has private career board.
         HTTPException
             An error occured while requesting.
 
@@ -2038,8 +2357,15 @@ class Client:
         -------
         :class:`float`
             The users battlepass level.
-        """
-        data = await self.fetch_multiple_battlepass_levels((user_id,))
+        """  # noqa
+        data = await self.fetch_multiple_battlepass_levels(
+            (user_id,),
+            start_time=start_time,
+            end_time=end_time
+        )
+        if user_id not in data:
+            raise Forbidden('User has private career board.')
+
         return data[user_id]
 
     async def fetch_leaderboard(self, stat: str) -> List[Dict[str, StrOrInt]]:
@@ -2099,11 +2425,15 @@ class Client:
 
     async def _create_party(self,
                             config: Optional[dict] = None) -> ClientParty:
-        async with self._join_party_lock:
+        aquiring = not self.auth._refresh_lock.locked()
+        try:
+            if aquiring:
+                await self._join_party_lock.acquire()
+
             if isinstance(config, dict):
-                cf = {**self.default_party_config, **config}
+                cf = {**self.default_party_config.config, **config}
             else:
-                cf = self.default_party_config
+                cf = self.default_party_config.config
 
             while True:
                 try:
@@ -2112,7 +2442,7 @@ class Client:
                 except HTTPException as exc:
                     if exc.message_code != ('errors.com.epicgames.social.'
                                             'party.user_has_party'):
-                        exc.reraise()
+                        raise
 
                     data = await self.http.party_lookup_user(self.user.id)
                     async with self._leave_lock:
@@ -2124,23 +2454,39 @@ class Client:
                             m = ('errors.com.epicgames.social.'
                                  'party.party_not_found')
                             if e.message_code != m:
-                                e.reraise()
+                                raise
 
                     await self.xmpp.leave_muc()
 
             config = {**cf, **data['config']}
-            party = ClientParty(self, data)
+            party = self.construct_party(data)
             await party._update_members(members=data['members'])
-            self.user.set_party(party)
+            self.party = party
 
-            fut = asyncio.ensure_future(party.patch(updated={
-                'RawSquadAssignments_j': party.meta.refresh_squad_assignments()
-            }), loop=self.loop)
+            tasks = [
+                self.loop.create_task(party.join_chat()),
+            ]
+            await party.meta.meta_ready_event.wait()
 
-            await party.join_chat()
-            await party.set_privacy(config['privacy'])
-            await fut
+            updated, deleted = party.meta.set_privacy(config['privacy'])
+            tasks.append(party.patch(
+                updated={
+                    **updated,
+                    **party.construct_squad_assignments(),
+                    **party.meta.set_voicechat_implementation('VivoxVoiceChat')
+                },
+                deleted=deleted
+            ))
+            await asyncio.gather(*tasks)
+
             return party
+
+        finally:
+            if aquiring:
+                self._join_party_lock.release()
+
+    def is_creating_party(self) -> bool:
+        return self._join_party_lock.locked()
 
     async def join_to_party(self, party_id: str, *,
                             check_private: bool = True) -> ClientParty:
@@ -2181,7 +2527,7 @@ class Client:
             The party that was just joined.
         """
         async with self._join_party_lock:
-            if party_id == self.user.party.id:
+            if party_id == self.party.id:
                 raise PartyError('You are already a member of this party.')
 
             try:
@@ -2194,19 +2540,19 @@ class Client:
                             party_id
                         )
                     )
-                e.reraise()
+                raise
 
             if check_private:
                 if party_data['config']['joinability'] == 'INVITE_AND_FORMER':
                     raise Forbidden('You can\'t join a private party.')
 
-            await self.user.party._leave()
-            party = ClientParty(self, party_data)
-            self.user.set_party(party)
+            await self.party._leave()
+            party = self.construct_party(party_data)
+            self.party = party
 
             future = asyncio.ensure_future(self.wait_for(
                 'party_member_join',
-                check=lambda m: m.id == self.user.id
+                check=lambda m: m.id == self.user.id and party.id == m.party.id
             ), loop=self.loop)
 
             try:
@@ -2220,11 +2566,11 @@ class Client:
                 if e.message_code == ('errors.com.epicgames.social.'
                                       'party.party_join_forbidden'):
                     raise Forbidden('Client has no right to join this party.')
-                e.reraise()
+                raise
 
             party_data = await self.http.party_lookup(party_id)
-            party = ClientParty(self, party_data)
-            self.user.set_party(party)
+            party = self.construct_party(party_data)
+            self.party = party
             asyncio.ensure_future(party.join_chat(), loop=self.loop)
             await party._update_members(party_data['members'])
 
@@ -2277,6 +2623,17 @@ class Client:
             Status was an invalid type.
         """
         await self.xmpp.send_presence(status=status, to=to)
+
+    def set_avatar(self, avatar: Avatar) -> None:
+        """Sets the client's avatar and updates it for all friends.
+
+        Parameters
+        ----------
+        avatar: :class:`Avatar`
+            The avatar to set.
+        """
+        self.avatar = avatar
+        self.party.update_presence()
 
     async def fetch_lightswitch_status(self,
                                        service_id: str = 'Fortnite') -> bool:
@@ -2401,7 +2758,7 @@ class Client:
 
         Parameters
         ----------
-        :class:`Region`
+        region: :class:`Region`
             The region to request active LTMs for.
 
         Raises

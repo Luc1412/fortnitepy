@@ -31,19 +31,26 @@ import logging
 import datetime
 import uuid
 import itertools
+import unicodedata
+import aiohttp
 
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional, Union, Awaitable, Any
+from typing import TYPE_CHECKING, Optional, Union, Awaitable, Any, Tuple
 
-from .errors import XMPPError, PartyError
+from .errors import XMPPError, PartyError, HTTPException
 from .message import FriendMessage, PartyMessage
-from .party import Party, PartyInvitation, PartyJoinConfirmation
+from .party import Party, ReceivedPartyInvitation, PartyJoinConfirmation
 from .presence import Presence
+from .enums import AwayStatus
 
 if TYPE_CHECKING:
     from .client import Client
 
 log = logging.getLogger(__name__)
+
+
+def is_RandALCat(c: str) -> bool:
+    return unicodedata.bidirectional(c) in ('R', 'AL')
 
 
 class EventContext:
@@ -54,7 +61,7 @@ class EventContext:
         self.client = client
         self.body = body
 
-        self.party = self.client.user.party
+        self.party = self.client.party
         self.created_at = datetime.datetime.utcnow()
 
 
@@ -104,6 +111,188 @@ class EventDispatcher:
 dispatcher = EventDispatcher()
 
 
+class WebsocketTransport:
+    def __init__(self, loop: asyncio.AbstractEventLoop,
+                 stream: 'WebsocketXMLStream',
+                 logger: logging.Logger) -> None:
+        self.loop = loop
+        self.stream = stream
+        self.logger = logger
+
+        self.connection = None
+        self._buffer = b''
+        self._reader_task = None
+        self._close_event = asyncio.Event()
+
+    async def create_connection(self, *args,
+                                **kwargs) -> aiohttp.ClientWebSocketResponse:
+        self.session = aiohttp.ClientSession()
+        self.connection = con = await self.session.ws_connect(
+            *args, **kwargs
+        )
+        self.loop.create_task(self.reader())
+        self.stream.connection_made(self)
+        self.logger.debug('Websocket connection established.')
+        return con
+
+    async def reader(self) -> None:
+        self.logger.debug('Websocket reader is now running.')
+
+        while True:
+            msg = await self.connection.receive()
+
+            if msg.type == aiohttp.WSMsgType.text:
+                self.stream.data_received(msg.data)
+            if msg.type == aiohttp.WSMsgType.closed:
+                break
+            if msg.type == aiohttp.WSMsgType.error:
+                break
+
+    async def send(self, data: bytes) -> None:
+        await self.connection.send_bytes(data)
+
+    def write(self, data: bytes) -> None:
+        self._buffer += data
+
+    def flush(self) -> None:
+        if self._buffer:
+            asyncio.ensure_future(self.send(self._buffer), loop=self.loop)
+
+        self._buffer = b''
+
+    def can_write_eof(self) -> bool:
+        return False
+
+    def write_eof(self) -> None:
+        raise NotImplementedError("Cannot write_eof() on ws transport")
+
+    def _stop_reader(self) -> None:
+        if self._reader_task is not None and not self._reader_task.cancelled():
+            self._reader_task.cancel()
+
+    def close_callback(self, *args) -> None:
+        self._close_event.set()
+
+    def on_close(self, *args) -> None:
+        # We do this to make sure connection_lost() doesnt re-call
+        # _writer.abort().
+        self.stream._writer = None
+
+        self.stream.connection_lost(None)
+
+        try:
+            task = self.loop.create_task(self.session.close())
+        except AttributeError:
+            pass
+        else:
+            task.add_done_callback(self.close_callback)
+
+    def close(self) -> None:
+        if not self.connection:
+            raise RuntimeError('Cannot close a non-existing connection.')
+
+        task = self.loop.create_task(self.connection.close())
+        task.add_done_callback(self.on_close)
+
+        self._stop_reader()
+
+    async def wait_closed(self) -> None:
+        await self._close_event
+
+    def get_extra_info(self, *args, **kwargs) -> Any:
+        return self.connection.get_extra_info(*args, **kwargs)
+
+
+class WebsocketXMLStreamWriter(aioxmpp.xml.XMLStreamWriter):
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._writer.endElementNS(
+            (aioxmpp.utils.namespaces.xmlstream, "stream"),
+            None
+        )
+        for prefix in self._nsmap_to_use:
+            self._writer.endPrefixMapping(prefix)
+        self._writer.endDocument()
+        self._writer.flush()
+        del self._writer
+
+
+class WebsocketXMLStream(aioxmpp.protocol.XMLStream):
+    def _reset_state(self) -> None:
+        self._kill_state()
+
+        self._processor = aioxmpp.xml.XMPPXMLProcessor()
+        self._processor.stanza_parser = self.stanza_parser
+        self._processor.on_stream_header = self._rx_stream_header
+        self._processor.on_stream_footer = self._rx_stream_footer
+        self._processor.on_exception = self._rx_exception
+        self._parser = aioxmpp.xml.make_parser()
+        self._parser.setContentHandler(self._processor)
+        self._debug_wrapper = None
+
+        if self._logger.getEffectiveLevel() <= logging.DEBUG:
+            dest = aioxmpp.protocol.DebugWrapper(self._transport, self._logger)
+            self._debug_wrapper = dest
+        else:
+            dest = self._transport
+
+        self._writer = WebsocketXMLStreamWriter(
+            dest,
+            self._to,
+            nsmap={None: "jabber:client"},
+            sorted_attributes=self._sorted_attributes)
+
+
+class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
+    @property
+    def tls_supported(self) -> bool:
+        return False
+
+    @property
+    def dane_supported(self) -> bool:
+        return False
+
+    async def connect(self, loop: asyncio.AbstractEventLoop,
+                      metadata: aioxmpp.security_layer.SecurityLayer,
+                      domain: str,
+                      host: str,
+                      port: int,
+                      negotiation_timeout: Union[int, float],
+                      base_logger: Optional[logging.Logger] = None
+                      ) -> Tuple[WebsocketTransport,
+                                 WebsocketXMLStream,
+                                 aioxmpp.nonza.StreamFeatures]:
+        features_future = asyncio.Future(loop=loop)
+
+        stream = WebsocketXMLStream(
+            to=domain,
+            features_future=features_future,
+            base_logger=base_logger,
+        )
+
+        if base_logger is not None:
+            logger = base_logger.getChild(type(self).__name__)
+        else:
+            logger = logging.getLogger(".".join([
+                __name__, type(self).__qualname__,
+            ]))
+
+        transport = WebsocketTransport(
+            loop,
+            stream,
+            logger,
+        )
+        await transport.create_connection(
+            'wss://{host}'.format(host=host),
+            protocols=('xmpp',),
+            timeout=10,
+        )
+
+        return transport, stream, await features_future
+
+
 class XMPPClient:
     def __init__(self, client: 'Client') -> None:
         self.client = client
@@ -114,37 +303,55 @@ class XMPPClient:
         self._task = None
         self.muc_room = None
 
-    def jid(self, id: str) -> aioxmpp.JID:
-        return aioxmpp.JID.fromstr('{}@{}'.format(id,
-                                                  self.client.service_host))
+    def jid(self, user_id: str) -> aioxmpp.JID:
+        return aioxmpp.JID.fromstr('{}@{}'.format(
+            user_id,
+            self.client.service_host
+        ))
+
+    def _remove_illegal_characters(self, chars: str) -> str:
+        for c in chars:
+            if is_RandALCat(c):
+                chars = chars.replace(c, '')
+            if ord(c) in (0,):
+                chars = chars.replace(c, '')
+        return chars
 
     def _create_invite(self, from_id: str, data: dict) -> dict:
-        now = datetime.datetime.utcnow()
-        expires_at = now + datetime.timedelta(hours=4)
+        sent_at = self.client.from_iso(data['sent'])
+        expires_at = sent_at + datetime.timedelta(hours=4)
 
         for m in data['members']:
             if m['account_id'] == from_id:
                 member = m
                 break
 
-        build_id = data['meta']['urn:epic:cfg:build-id_s']
+        party_m = data['meta']
+        member_m = member['meta']
+
+        meta = {
+            'urn:epic:conn:type_s': 'game',
+            'urn:epic:cfg:build-id_s': party_m['urn:epic:cfg:build-id_s'],
+            'urn:epic:invite:platformdata_s': '',
+        }
+
+        if 'Platform_j' in member_m:
+            meta['Platform_j'] = json.loads(
+                member_m['Platform_j']
+            )['Platform']['platformStr']
+
+        if 'urn:epic:member:dn_s' in member['meta']:
+            meta['urn:epic:member:dn_s'] = member_m['urn:epic:member:dn_s']
+
         inv = {
             'party_id': data['id'],
             'sent_by': from_id,
             'sent_to': self.client.user.id,
-            'sent_at': self.client.to_iso(now),
-            'updated_at': self.client.to_iso(now),
+            'sent_at': self.client.to_iso(sent_at),
+            'updated_at': self.client.to_iso(sent_at),
             'expires_at': self.client.to_iso(expires_at),
             'status': 'SENT',
-            'meta': {
-                'urn:epic:conn:type_s': 'game',
-                'urn:epic:conn:platform_s': json.loads(
-                    member['meta']['Platform_j']
-                )['Platform']['platformStr'],
-                'urn:epic:member:dn_s': member['meta']['urn:epic:member:dn_s'],
-                'urn:epic:cfg:build-id_s': build_id,
-                'urn:epic:invite:platformdata_s': '',
-            }
+            'meta': meta
         }
         return inv
 
@@ -205,12 +412,16 @@ class XMPPClient:
             else:
                 data = data.get_raw()
 
-            pf = self.client.store_pending_friend({
+            data = {
                 **data,
                 'direction': _payload['direction'],
                 'status': _status,
                 'created': body['timestamp']
-            })
+            }
+            if _payload['direction'] == 'INBOUND':
+                pf = self.client.store_incoming_pending_friend(data)
+            else:
+                pf = self.client.store_outgoing_pending_friend(data)
 
             self.client.dispatch_event('friend_request', pf)
 
@@ -266,17 +477,24 @@ class XMPPClient:
     @dispatcher.event('com.epicgames.social.party.notification.v0.PING')
     async def event_ping_received(self, ctx: EventContext) -> None:
         body = ctx.body
-
         pinger = body['pinger_id']
-        data = (await self.client.http.party_lookup_ping(pinger))[0]
+        try:
+            data = (await self.client.http.party_lookup_ping(pinger))[0]
+        except IndexError:
+            return
+        except HTTPException as exc:
+            m = 'errors.com.epicgames.social.party.ping_not_found'
+            if exc.message_code == m:
+                return
 
-        invite = None
+            raise
+
         for inv in data['invites']:
             if inv['sent_by'] == pinger and inv['status'] == 'SENT':
                 invite = inv
-
-        if invite is None:
-            invite = self._create_invite(pinger, data)
+                break
+        else:
+            invite = self._create_invite(pinger, {**body, **data})
 
         if 'urn:epic:cfg:build-id_s' not in invite['meta']:
             pres = self.client.get_presence(pinger)
@@ -298,14 +516,24 @@ class XMPPClient:
         new_party = Party(self.client, data)
         await new_party._update_members(members=data['members'])
 
-        invitation = PartyInvitation(self.client, new_party, net_cl, invite)
+        invitation = ReceivedPartyInvitation(
+            self.client,
+            new_party,
+            net_cl,
+            invite
+        )
         self.client.dispatch_event('party_invite', invitation)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_JOINED')  # noqa
     async def event_party_member_joined(self,
                                         ctx: EventContext) -> None:
         body = ctx.body
-        party = ctx.party
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
 
         if party is None:
             return
@@ -313,7 +541,7 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(body.get('account_id'))
+        member = party.members.get(user_id)
         if member is None:
             member = party._create_member(body)
 
@@ -321,13 +549,14 @@ class XMPPClient:
                 party._create_clientmember(body)
 
         if party.me is not None:
-            asyncio.ensure_future(party.me.patch(), loop=self.client.loop)
+            party.me.do_on_member_join_patch()
 
-        if party.me and party.me.leader:
-            part = party.meta.refresh_squad_assignments()
-            fut = asyncio.ensure_future(party.patch(updated={
-                'RawSquadAssignments_j': part
-            }), loop=self.client.loop)
+        yielding = party.me._default_config.yield_leadership
+        if party.me and party.me.leader and not yielding:
+            fut = asyncio.ensure_future(
+                party.refresh_squad_assignments(),
+                loop=self.client.loop
+            )
 
         try:
             if member.id == self.client.user.id:
@@ -352,7 +581,12 @@ class XMPPClient:
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_LEFT')
     async def event_party_member_left(self, ctx: EventContext) -> None:
         body = ctx.body
-        party = ctx.party
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
 
         if party is None:
             return
@@ -360,17 +594,26 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(body.get('account_id'))
+        member = party.members.get(user_id)
         if member is None:
             return
 
         party._remove_member(member.id)
+
+        if party.me and party.me.leader and member.id != party.me.id:
+            await party.refresh_squad_assignments()
+
         self.client.dispatch_event('party_member_leave', member)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_EXPIRED')  # noqa
     async def event_party_member_expired(self, ctx: EventContext) -> None:
         body = ctx.body
-        party = ctx.party
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
 
         if party is None:
             return
@@ -378,22 +621,30 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(body.get('account_id'))
+        member = party.members.get(user_id)
         if member is None:
             return
 
+        party._remove_member(member.id)
+
+        if party.me and party.me.leader and member.id != party.me.id:
+            await party.refresh_squad_assignments()
+
         if member.id == self.client.user.id:
             p = await self.client._create_party()
+            self.client.party = p
 
-            self.client.user.set_party(p)
-
-        party._remove_member(member.id)
         self.client.dispatch_event('party_member_expire', member)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_KICKED')  # noqa
     async def event_party_member_kicked(self, ctx: EventContext) -> None:
         body = ctx.body
-        party = ctx.party
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
 
         if party is None:
             return
@@ -401,23 +652,32 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(body.get('account_id'))
+        member = party.members.get(user_id)
         if member is None:
             return
+
         party._remove_member(member.id)
+
+        if party.me and party.me.leader and member.id != party.me.id:
+            await party.refresh_squad_assignments()
 
         if member.id == self.client.user.id:
             await self.leave_muc()
             p = await self.client._create_party()
 
-            self.client.user.set_party(p)
+            self.client.party = p
 
         self.client.dispatch_event('party_member_kick', member)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_DISCONNECTED')  # noqa
     async def event_party_member_disconnected(self, ctx: EventContext) -> None:
         body = ctx.body
-        party = ctx.party
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
 
         if party is None:
             return
@@ -425,11 +685,15 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(body.get('account_id'))
+        member = party.members.get(user_id)
         if member is None:
             return
 
         party._remove_member(member.id)
+
+        if party.me and party.me.leader and member.id != party.me.id:
+            await party.refresh_squad_assignments()
+
         self.client.dispatch_event('party_member_disconnect', member)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_NEW_CAPTAIN')  # noqa
@@ -437,13 +701,19 @@ class XMPPClient:
         body = ctx.body
         party = ctx.party
 
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
+
         if party is None:
             return
 
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(body.get('account_id'))
+        member = party.members.get(user_id)
         if member is None:
             return
 
@@ -453,7 +723,7 @@ class XMPPClient:
 
         member.update_role('CAPTAIN')
         if member.id == self.client.user.id:
-            self.client.user.party.me.update_role('CAPTAIN')
+            self.client.party.me.update_role('CAPTAIN')
 
         party.update_presence()
         self.client.dispatch_event('party_member_promote', old_leader, member)
@@ -461,7 +731,12 @@ class XMPPClient:
     @dispatcher.event('com.epicgames.social.party.notification.v0.PARTY_UPDATED')  # noqa
     async def event_party_updated(self, ctx: EventContext) -> None:
         body = ctx.body
-        party = ctx.party
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
 
         if party is None:
             return
@@ -469,15 +744,21 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
+        def _getattr(member, key):
+            value = getattr(member, key)
+            if callable(value):
+                value = value()
+            return value
+
         check = {'playlist_info': 'playlist', 'squad_fill': None,
                  'privacy': None}
-        pre_values = {k: getattr(party, k) for k in check.keys()}
+        pre_values = {k: _getattr(party, k) for k in check.keys()}
 
         party._update(body)
         self.client.dispatch_event('party_update', party)
 
         for key, pre_value in pre_values.items():
-            value = getattr(party, key)
+            value = _getattr(party, key)
             if pre_value != value:
                 self.client.dispatch_event(
                     'party_{0}_change'.format(check[key] or key),
@@ -490,7 +771,12 @@ class XMPPClient:
     async def event_party_member_state_updated(self,
                                                ctx: EventContext) -> None:
         body = ctx.body
-        party = ctx.party
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
 
         if party is None:
             return
@@ -498,10 +784,10 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(body.get('account_id'))
+        member = party.members.get(user_id)
         if member is None:
             def check(m):
-                return m.id == body.get('account_id')
+                return m.id == user_id
 
             try:
                 member = await self.client.wait_for(
@@ -510,33 +796,72 @@ class XMPPClient:
                     timeout=3
                 )
             except asyncio.TimeoutError:
-                if body.get('account_id') == self.client.user.id:
+                if user_id == self.client.user.id:
                     await party._leave()
                     p = await self.client._create_party()
-                    self.client.user.set_party(p)
+                    self.client.party = p
                 return
+
+        def _getattr(member, key):
+            value = getattr(member, key)
+            if callable(value):
+                value = value()
+            return value
 
         check = ('ready', 'input', 'assisted_challenge', 'outfit', 'backpack',
                  'pet', 'pickaxe', 'contrail', 'emote', 'emoji', 'banner',
-                 'battlepass_info')
-        pre_values = {k: getattr(member, k) for k in check}
+                 'battlepass_info', 'in_match', 'match_players_left')
+        pre_values = {k: _getattr(member, k) for k in check}
 
         check_variants = ('outfit_variants', 'backpack_variants',
                           'pickaxe_variants', 'contrail_variants')
-        pre_variants_values = {k: getattr(member, k) for k in check_variants}
-
+        pre_variants_values = {k: _getattr(member, k) for k in check_variants}
         member.update(body)
+
+        if party._default_config.team_change_allowed or not party.me.leader:
+            req_j = body['member_state_updated'].get(
+                'Default:MemberSquadAssignmentRequest_j'
+            )
+            if req_j is not None:
+                req = json.loads(req_j)['MemberSquadAssignmentRequest']
+                version = req['version']
+                if version != member._assignment_version:
+                    member._assignment_version = version
+
+                    swap_member_id = req['swapTargetMemberId']
+                    if swap_member_id != 'INVALID':
+                        new_positions = {
+                            member.id: req['targetAbsoluteIdx'],
+                            swap_member_id: req['startingAbsoluteIdx']
+                        }
+                        if party.me.leader:
+                            await party.refresh_squad_assignments(
+                                new_positions=new_positions
+                            )
+
+                        try:
+                            self.client.dispatch_event(
+                                'party_member_team_swap',
+                                *[party.members[k] for k in new_positions]
+                            )
+                        except KeyError:
+                            pass
+
         self.client.dispatch_event('party_member_update', member)
 
+        def _dispatch(key, member, pre_value, value):
+            self.client.dispatch_event(
+                'party_member_{0}_change'.format(key),
+                member,
+                pre_value,
+                value
+            )
+
         for key, pre_value in pre_values.items():
-            value = getattr(member, key)
+            value = _getattr(member, key)
+
             if pre_value != value:
-                self.client.dispatch_event(
-                    'party_member_{0}_change'.format(key),
-                    member,
-                    pre_value,
-                    value
-                )
+                _dispatch(key, member, pre_value, value)
 
         def compare_variants(a, b):
             def construct_set(v):
@@ -544,21 +869,21 @@ class XMPPClient:
             return construct_set(a) == construct_set(b)
 
         for key, pre_value in pre_variants_values.items():
-            value = getattr(member, key)
+            value = _getattr(member, key)
             if not compare_variants(pre_value, value):
-                self.client.dispatch_event(
-                    'party_member_{0}_change'.format(key),
-                    member,
-                    pre_value,
-                    value
-                )
+                _dispatch(key, member, pre_value, value)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_REQUIRE_CONFIRMATION')  # noqa
     async def event_party_member_require_confirmation(self,
                                                       ctx: EventContext
                                                       ) -> None:
         body = ctx.body
-        party = ctx.party
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
 
         if party is None:
             return
@@ -566,7 +891,6 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        user_id = body['account_id']
         user = self.client.get_user(user_id)
         if user is None:
             user = await self.client.fetch_profile(user_id)
@@ -590,15 +914,17 @@ class XMPPClient:
         if '-' in user_id:
             return
 
-        if presence.type_ not in (aioxmpp.PresenceType.AVAILABLE,
-                                  aioxmpp.PresenceType.UNAVAILABLE):
+        if not presence.type_.is_presence_state:
             return
 
         try:
             data = json.loads(presence.status.any())
-            if (data.get('Status', '') == ''
-                    or 'bIsPlaying' not in data
-                    or not isinstance(data.get('Properties', {}), dict)):
+
+            # We do this to filter out kairos from launcher presences
+            ch = data.get('bIsEmbedded', False) or data.get('Status', '') != ''
+
+            is_dict = isinstance(data.get('Properties', {}), dict)
+            if (not ch or 'bIsPlaying' not in data or not is_dict):
                 return
         except ValueError:
             return
@@ -618,11 +944,19 @@ class XMPPClient:
         if not presence.from_.is_bare:
             platform = presence.from_.resource.split(':')[2]
 
+        is_available = presence.type_ is aioxmpp.PresenceType.AVAILABLE
+
+        try:
+            away = AwayStatus(presence.show)
+        except ValueError:
+            away = AwayStatus.ONLINE
+
         _pres = Presence(
             self.client,
             user_id,
             platform,
-            presence.type_ is aioxmpp.PresenceType.AVAILABLE,
+            is_available,
+            away,
             data
         )
 
@@ -634,12 +968,15 @@ class XMPPClient:
             except (KeyError, AttributeError):
                 pass
 
-        if presence.type_ == (aioxmpp.PresenceType.UNAVAILABLE
-                              and friend.is_online()):
-            friend._update_last_logout(datetime.datetime.utcnow())
+        before_pres = friend.last_presence
 
-        self.client._presences.set(user_id, _pres)
-        self.client.dispatch_event('friend_presence', _pres)
+        if not is_available and friend.is_online():
+            friend._update_last_logout(datetime.datetime.utcnow())
+            self.client._presences.remove(user_id, None)
+        else:
+            self.client._presences.set(user_id, _pres)
+
+        self.client.dispatch_event('friend_presence', before_pres, _pres)
 
     def setup_callbacks(self,
                         messages: bool = True,
@@ -696,6 +1033,8 @@ class XMPPClient:
     async def _run(self, future: asyncio.Future) -> None:
         async with self.xmpp_client.connected() as stream:
             self.stream = stream
+            stream.soft_timeout = datetime.timedelta(minutes=5)
+            stream.round_trip_time = datetime.timedelta(minutes=5)
             future.set_result(None)
             while True:
                 await asyncio.sleep(1)
@@ -720,7 +1059,7 @@ class XMPPClient:
             override_peer=[(
                 self.client.service_domain,
                 self.client.service_port,
-                aioxmpp.connector.STARTTLSConnector()
+                XMPPOverWebsocketConnector()
             )],
             loop=self.client.loop
         )
@@ -740,7 +1079,7 @@ class XMPPClient:
 
     async def send_presence_on_start(self) -> None:
         await self.client.wait_until_ready()
-        await self.send_presence(status=self.client.user.party.last_raw_status)
+        await self.send_presence(status=self.client.party.last_raw_status)
 
     async def close(self) -> None:
         log.debug('Attempting to close xmpp client')
@@ -774,7 +1113,7 @@ class XMPPClient:
             return
 
         user_id = member.direct_jid.localpart
-        party = self.client.user.party
+        party = self.client.party
 
         if (user_id == self.client.user.id or member.nick is None
                 or user_id not in party.members):
@@ -799,7 +1138,7 @@ class XMPPClient:
                      muc_reason: str,
                      **kwargs: Any) -> None:
         if muc_leave_mode is aioxmpp.muc.LeaveMode.BANNED:
-            mem = self.client.user.party.members[member.direct_jid.localpart]
+            mem = self.client.party.members[member.direct_jid.localpart]
             self.client.dispatch_event('party_member_chatban',
                                        mem,
                                        muc_reason)
@@ -808,12 +1147,16 @@ class XMPPClient:
         muc_jid = aioxmpp.JID.fromstr(
             'Party-{}@muc.prod.ol.epicgames.com'.format(party_id)
         )
-        nick = '{0.display_name}:{0.id}:{1}'.format(
-            self.client.user,
+        nick = '{0}:{0}:{1}'.format(
+            self._remove_illegal_characters(self.client.user.display_name),
+            self.client.user.id,
             self.xmpp_client.local_jid.resource
         )
 
-        room, fut = self.muc_service.join(muc_jid, nick)
+        room, fut = self.muc_service.join(
+            muc_jid,
+            nick
+        )
 
         room.on_message.connect(self.muc_on_message)
         room.on_join.connect(self.muc_on_member_join)
@@ -899,10 +1242,11 @@ class XMPPClient:
 
     async def get_presence(self, jid: aioxmpp.JID) -> Presence:
         self.client.loop.create_task(self.send_presence_probe(jid))
-        return await self.client.wait_for(
+        _, after = await self.client.wait_for(
             'friend_presence',
-            check=lambda p: p.friend.id == jid.localpart
+            check=lambda b, a: a.friend.id == jid.localpart
         )
+        return after
 
     async def send_presence_probe(self, to: aioxmpp.JID) -> None:
         presence = aioxmpp.Presence(

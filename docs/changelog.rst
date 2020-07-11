@@ -5,6 +5,340 @@ Changelog
 
 Detailed version changes.
 
+
+v2.2.1
+------
+
+Fixes an issue that caused some accounts with lots of friends to crash on startup.
+
+
+v2.2.0
+------
+
+Changed
+~~~~~~~
+
+- (**Breaking**) Split `PendingFriend` into two separate objects :class:`IncomingPendingFriend` and :class:`OutgoingPendingFriend` depending on the direction of the request. Keep in mind that :attr:`Client.pending_friends` can include instances of both classes.
+- (**Breaking**) :func:`event_friend_presence()` now takes two arguments ``before`` and ``after``.
+- (**Breaking**) ``PendingFriendBase.inbound`` has been renamed to ``PendingFriendBase.incoming``.
+- Made some small visual improvements to the documentation.
+
+Added
+~~~~~
+
+- Added :attr:`SeasonEndTimestamp.SEASON_12` and :attr:`SeasonStartTimestamp.SEASON_13`.
+- You can now cancel outgoing friend requests with :meth:`OutgoingPendingFriend.cancel()`.
+- Added :attr:`Store.special_featured_items`.
+- Added :attr:`Store.special_daily_items`.
+- Added missing documentation to various attributes, methods and functions. The most relevant is the addition of ``meta`` keyword-arg to :class:`DefaultPartyConfig` which was already implemented but not documented.
+- Added missing type hinting to various methods.
+
+Removed
+~~~~~~~
+
+- Removed API KEY usage from the Fortnite-API example. Thanks (cup#9125).
+- Removed some piece of code which auto claimed the fortnite entitlement. This has not been actively used for some updates.
+- ``beautifulsoup4`` and ``websockets`` have been removed from requirements because they're no longer used.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed various bugs regarding the xmpp over websocket solution introduced in the last minor update. The library now uses aiohttp for websockets instead of the websockets library.
+- Fixed a rare issue regarding last_online that sometimes crashed the client on startup.
+- Fixed an issue that caused voice chat to not work for regular users in the clients party.
+- Fixed a rare error that was sometimes raised in :meth:`PartyJoinConfirmation.confirm()` and :meth:`PartyJoinConfirmation.reject()`
+- Silenced an error in processing of :func:`event_party_invite()`.
+
+
+
+
+v2.1.1
+------
+
+Fixes an issue where :attr:`Friend.last_logout` would sometimes be a string after v2.1.0.
+
+
+v2.1.0
+------
+
+This update fixes the new xmpp authentication issue + some other bugs.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed xmpp authentication by running xmpp over a custom xmpp over websocket connector.
+- You can now use ``ProactorEventLoop`` with fortnitepy.
+- Fixed an issue where a bot would not be able to start in some scenarios because of a friend missing the ``last_online`` property.
+- Fixed an issue where a party was not created after refreshing the session. This was the cause of ``error code -93`` after refreshes.
+- Fixed an issue that caused :meth:`Client.restart()` to not work.
+- Silenced an error in processing of :func:`party_team_member_swap`.
+
+
+v2.0.7
+------
+
+Fixes bugs introduced in fortnite v13.00 + fixes other bugs and adds some other changes.
+
+Changes
+~~~~~~~
+
+- :meth:`Client.add_friend()` and other methods to add/accept friends now raises more specific exceptions.
+- A RuntimeError with more info is now raised if a running ProactorEventLoop is found when importing fortnitepy.
+
+Added
+~~~~~
+
+- :exc:`DuplicateFriendship`
+- :exc:`FriendshipRequestAlreadySent`
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed an issue that caused no party meta related stuff to work after fortnite v13.00 (Invisible players fix).
+- Fixed an issue where presence initialization failed because of a missing property.
+- Removed ``party`` from :class:`ClientUser`.
+- Fixed an issue where the xmpp stream would timeout in some cases. (Fixes `issue #67 <https://github.com/Terbau/fortnitepy/issues/67>`_)
+- :class:`SentPartyInvitation` has now been added to the docs.
+- :func:`event_command_error()`, :func:`event_command()` and :func:`event_command_completion()` are now properly named in the documentation.
+
+
+v2.0.6
+------
+
+Various bug fixes
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed an issue that caused :class:`EmailAndPasswordAuth` to not work in some cases.
+- Fixed errors not being raised correctly in newer versions when using :func:`start_multiple()` or :func:`run_multiple()`.
+- Unnecessary errors are not longer raised when closing the client before it has started.
+- Fixed an issue that caused :func:`event_party_member_in_match_change()` to not work.
+
+Other
+~~~~~
+
+- Added documentation to :meth:`ClientPartyMember.set_in_match()` and :meth:`ClientPartyMember.clear_in_match()`.
+- Edited docstrings in all examples to be up to date with recent changes.
+
+
+v2.0.5
+------
+
+Changes
+~~~~~~~
+
+- Added :class:`AuthorizationCodeAuth` as an auth method.
+- Added optional parameter ``authorization_code`` to :class:`AdvancedAuth`.
+- Added optional parameter ``prompt_authorization_code`` to :class:`AdvancedAuth`.
+- (**Breaking**) Renamed optional parameter ``prompt_exchange_code_if_invalid`` -> `prompt_code_if_invalid` for :class:`AdvancedAuth`.
+- (**Breaking**) Renamed optional parameter ``prompt_exchange_code_if_throttled`` -> `prompt_code_if_throttled` for :class:`AdvancedAuth`.
+- (**Breaking**) Renamed parameter ``exchange_code`` -> ``code`` for :class:`ExchangeCodeAuth`.
+- Updated all examples to use ``prompt_authorization_code`` since thats now the easiest method.
+
+
+v2.0.4
+------
+
+Small update which introduces some serious memory optimizations for accounts with many friends + exchange code fix.
+
+Changes
+~~~~~~~
+
+- Added keyword argument ``prompt_exchange_code_if_invalid`` to :class:`AdvancedAuth`.
+- Exchange code prompt messages now includes the cause for exchange code being needed.
+- Added :attr:`AuthException.original` which can be used to retrieve the original error object.
+- Made some serious changes to optimize memory usage.
+- Corrected the endpoint used for retrieving an exchange code in :class:`EmailAndPasswordAuth`.
+- Fixed an issue that caused invalid party team position swap requests to not be handled correctly.
+- Fixed an issue where constructing presences would fail in some cases due to an unexpected type.
+
+
+v2.0.1 - v2.0.3
+---------------
+
+Hotpatches to fix some overlooked major bugs.
+
+
+v2.0.0
+------
+
+Big update which adds a commands extension and other huge changes.
+
+Changes
+~~~~~~~
+
+- The main way to access the clients party has been moved from :class:`ClientUser` to :class:`Client`. ``client.user.party`` -> ``client.party``.
+- :class:`Client`'s keyword arg ``default_party_config`` has been completely reworked. Read more about it on :class:`Client`'s page.
+- :class:`Client`'s keyword arg ``default_party_member_config`` has been completely reworked. Read more about it on :class:`Client`'s page.
+- Renamed ``Client.logout()`` -> :meth:`Client.close()`.
+- Renamed ``event_logout()`` -> :func:`event_close()`.
+- Renamed ``PartyInvitation`` -> :class:`ReceivedPartyInvitation`.
+- :attr:`Presence.avatar` now returns :class:`Avatar`.
+
+Added
+~~~~~
+
+- Ext.commands has been ported from discord.py to work with fortnitepy. All changes are wayyyy to big to mention in this changelog. You can read more about it here :ref:`here <fortnitepy_ext_commands>`.
+- Added :meth:`Client.search_profiles()` to search up to 100 users by a name prefix.
+- Added :class:`ProfileSearchEntryUser`.
+- Added enum :class:`ProfileSeachPlatform`.
+- Added enum :class:`ProfileSearchMatchType`.
+- Added :meth:`Client.search_sac_by_slug()` to search for support a creator code owners by a slug.
+- Added :class:`SacSearchEntryUser`.
+- Added :class:`Avatar`. This can be passed to :class:`Client` on initialization to set an avatar for the bot.
+- Added enum :class:`KairosBackgroundColorPreset` which offers color presets for :class:`Avatar`.
+- Added :meth:`Client.set_avatar()` to set a new avatar while the client is running.
+- Added :meth:`Friend.fetch_mutual_friends()` to fetch friends the client and this friend have in common.
+- Added event :func:`event_party_team_swap()`.
+- Added event :func:`event_party_member_in_match_change()`.
+- Added event :func:`event_party_member_match_players_left_change()`.
+- Added new example for integration with the web server Sanic.
+- Added an ios session that is kept alive at all times. This means that you finally can use internal device auth methods after launch.
+- Added :meth:`Client.remove_all_friends()`.
+- Added enums :class:`SeasonStartTimestamp` and :class:`SeasonEndTimestamp` to help with passing season start and ends to stats methods.
+- Added ``start_time`` and ``end_time`` kwargs to all battlepass level fetch methods. This can be used to fetch levels from past chapter 2 seasons.
+- Added enum :class:`AwayStatus`.
+- Added :class:`JustChattingClientPartyMember` that can be passed to :class:`DefaultPartyMemberConfig` for the client to 
+- Added :class:`DefaultPartyConfig`.
+- Added :class:`DefaultPartyMemberConfig`.
+- Added enum :class:`PartyDiscoverability`.
+- Added enum :class:`PartyJoinability`.
+- Added :class:`SentPartyInvitation` which represents a sent party invite and offers functionality like resending the invite and cancelling it.
+- Added :meth:`ClientParty.edit()`.
+- Added :meth:`ClientParty.edit_and_keep()`.
+- Added :attr:`PartyMember.position` to get a members position in a party.
+- Added :attr:`PartyMember.will_yield_leadership`.
+- Added :meth:`PartyMember.is_just_chatting()`.
+- Added :meth:`PartyMember.in_match()`.
+- Added :meth:`ClientPartyMember.set_in_match()`.
+- Added :meth:`ClientPartyMember.clear_in_match()`.
+- Added :attr:`PartyMember.match_started_at`.
+- Added :attr:`PartyMember.match_players_left`.
+- Added :meth:`PartyMember.swap_position()`.
+- Added keyword ``enlightenment`` to :meth:`ClientPartyMember.set_backpack()`.
+- Added :meth:`Party.get_member()`.
+- Added :meth:`ClientParty.fetch_invites()`.
+- Added :attr:`Presence.away`.
+- Added :attr:`Presence.in_kairos`.
+
+Removed
+~~~~~~~
+
+- Removed ``Client.update_net_cl()``.
+- Removed ``Friend.fetch_mutual_friend_count``. You can now use the new :meth:`Friend.fetch_mutual_friends()`.
+- Removed ``ClientPartyMember.set_shout()``.
+- Removed ``Presence.avatar_colors``.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed an issue that caused party methods and sometimes party to be ``None`` whenever a new party was being created.
+- Fixed an issue that caused sessions to not be correctly killed when closing.
+- Fixed an issue where it was not possible to register more than one of each event.
+- Fixed an issue that caused :func:`event_party_member_confirm()` to not always work.
+- :meth:`Client.to_iso()` now only has floating point precision of three like fortnite expects.
+- :meth:`Client.run()` and other utility run functions now works correctly in docker environments.
+- Fixed an issue that caused display name cache lookups in profile fetch methods to not work.
+- :meth:`Client.event()` can now also correctly be used on staticmethods.
+- Fixed an issue that caused ``start_time`` and ``end_time`` in all stats fetch methods to not work.
+- :meth:`Client.fetch_multiple_br_stats()` now accepts more than 51 owners.
+- Fixed an issue where :exc:`HTTPException`'s were incomplete when raised from a graphql request.
+- Fixed an issue that caused some meta values to be incorrect in some instances because of a parsing error.
+- Fixed an issue where :attr:`PartyMember.platform` could be ``None`` in some rare cases.
+- Fixed an issue that crashed the client on startup if the clients display name contained arabic or other letters that are read in the other direction.
+
+Miscellanious
+~~~~~~~~~~~~~
+
+- Updated the build version.
+- Removed documentation for old client kwarg ``engine_build``.
+- Fixed some documentation issues.
+
+
+v1.7.0
+------
+
+Update to fix some issues regarding auth and overall control over the application + some more.
+
+Changes
+~~~~~~~
+
+- The ``exchange_code`` argument in :class:`ExchangeCodeAuth` and keyword argument in :class:`AdvancedAuth` now also accepts a callable or awaitable that must return an exchange code in form of a :class:`str`.
+
+Added
+~~~~~
+
+- Added :meth:`Client.fetch_profile_by_email()` to fetch a :class:`User` by their email.
+- Added :class:`RefreshTokenAuth` which can be used to authenticate by a launcher refresh token.
+- Added keyword argument ``gap_timeout`` to :func:`start_multiple()` and :func:`run_multiple()`. The value passed decides how long it should sleep between starting the clients to avoid throttling.
+- Added :attr:`PartyMember.enlightenments` to check the members enlightenment values.
+- Added keyword argument ``enlightenment`` to :meth:`ClientPartyMember.set_outfit()`. Read more about it in the docs.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed an issue that caused :meth:`Client.restart()` not to work with all of the available auth methods.
+- Fixed an issue where the wrong refresh_token was refreshed which resulted in no active launcher access token to be valid after the first auth refresh (~8 hours).
+- Fixed :func:`run_multiple()` not shutting down correctly in environments that depend on signals to shut down the process.
+- The client now ignores ghost pings (invites).
+
+
+v1.6.2
+------
+
+Fixes :exc:`HTTPException` not being raised and changes some stuff related to :exc:`AuthException`.
+
+Changes
+~~~~~~~
+
+- :exc:`AuthException` is now only raised when invalid credentials (email/password, device auth, exchange code or 2fa code) are passed and some other misc failures. It will no longer eat all errors raised.
+- Removed ``HTTPException.reraise()``.
+
+Added
+~~~~~
+
+- Added parameter ``prompt_exchange_code_if_throttled`` to :class:`AuthException`. If set to ``True`` it will prompt exchange code if the account is throttled.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed an issue that caused no :exc:`HTTPException`'s to be raised. This caused other errors which often looked weird.
+
+
+v1.6.1
+------
+
+Hotpatch to fix bots not being able to start.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed an issue that caused json payloads sometimes not being decoded.
+
+
+v1.6.0
+------
+
+This update fixes device authentication and adds some new methods to play around with.
+
+Added
+~~~~~
+
+- Added :meth:`ClientPartyMember.set_shout()` to set a shout (Unreleased feature which plays small audio clips).  
+- Added a parameter ``run_for`` to :meth:`ClientPartyMember.set_emoji()`.
+- Added :meth:`ClientPartyMember.clear_backpack()`.
+- Added :meth:`ClientPartyMember.clear_pet()`.
+- Added :meth:`ClientPartyMember.clear_contrail()`.
+- Added :meth:`ClientPartyMember.clear_assisted_challenge()`.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed an issue that caused device auth to not work with newly generated details.
+- Fixed an issue that caused :meth:`Client.fetch_profile_by_display_name()` to not work if the account requested had linked external platforms to their account.
+
+
 v1.5.5
 ------
 

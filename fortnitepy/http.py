@@ -133,8 +133,8 @@ class LightswitchPublicService(Route):
     AUTH = 'LAUNCHER_ACCESS_TOKEN'
 
 
-class PersonaPublicService(Route):
-    BASE = 'https://persona-public-service-prod06.ol.epicgames.com'
+class ProfileSearchService(Route):
+    BASE = 'https://user-search-service-prod.ol.epicgames.com'
     AUTH = 'FORTNITE_ACCESS_TOKEN'
 
 
@@ -178,11 +178,6 @@ class PartyService(Route):
     AUTH = 'FORTNITE_ACCESS_TOKEN'
 
 
-class PersonaPublicService(Route):  # noqa
-    BASE = 'https://persona-public-service-prod06.ol.epicgames.com'
-    AUTH = 'FORTNITE_ACCESS_TOKEN'
-
-
 class PresencePublicService(Route):
     BASE = 'https://presence-public-service-prod.ol.epicgames.com'
     AUTH = 'FORTNITE_ACCESS_TOKEN'
@@ -208,13 +203,13 @@ class HTTPClient:
     async def json_or_text(response: aiohttp.ClientResponse) -> Union[str,
                                                                       dict]:
         text = await response.text(encoding='utf-8')
-        if response.headers.get('content-type') == 'application/json':
+        if 'application/json' in response.headers.get('content-type', ''):
             return json.loads(text)
         return text
 
     @property
     def user_agent(self) -> str:
-        return 'EpicGamesLauncher/{0.client.build} {0.client.os}'.format(self)
+        return 'Fortnite/{0.client.build} {0.client.os}'.format(self)
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -223,10 +218,14 @@ class HTTPClient:
     def get_auth(self, auth: str) -> str:
         u_auth = auth.upper()
 
-        if u_auth == 'LAUNCHER_BASIC_TOKEN':
+        if u_auth == 'IOS_BASIC_TOKEN':
+            return 'basic {0}'.format(self.client.auth.ios_token)
+        elif u_auth == 'LAUNCHER_BASIC_TOKEN':
             return 'basic {0}'.format(self.client.auth.launcher_token)
         elif u_auth == 'FORTNITE_BASIC_TOKEN':
             return 'basic {0}'.format(self.client.auth.fortnite_token)
+        elif u_auth == 'IOS_ACCESS_TOKEN':
+            return self.client.auth.ios_authorization
         elif u_auth == 'LAUNCHER_ACCESS_TOKEN':
             return self.client.auth.launcher_authorization
         elif u_auth == 'FORTNITE_ACCESS_TOKEN':
@@ -312,14 +311,11 @@ class HTTPClient:
         if raw:
             return r
 
-        try:
-            _data = json.loads(data)
-            if 'errorCode' in _data:
-                raise HTTPException(r, _data)
-        except (KeyError, TypeError, json.decoder.JSONDecodeError):
-            pass
+        if 'errorCode' in data:
+            raise HTTPException(r, data)
 
         if graphql is not None:
+
             error_data = None
             for child_data in data:
                 if 'errors' in child_data:
@@ -328,13 +324,14 @@ class HTTPClient:
             if error_data is not None:
                 selected = error_data[0]
 
+                obj = {'errorMessage': selected['message']}
                 service_response = selected['serviceResponse']
                 if service_response == '':
-                    error_payload = {'errorMessage': selected['message']}
+                    error_payload = {}
                 else:
                     error_payload = json.loads(service_response)
 
-                raise HTTPException(r, error_payload)
+                raise HTTPException(r, {**obj, **error_payload})
 
             def get_payload(d):
                 return next(iter(d['data'].values()))
@@ -353,10 +350,12 @@ class HTTPClient:
             return await self._fn_request(method, route, auth, graphql,
                                           **kwargs)
         except HTTPException as exc:
-            catch = ('errors.com.epicgames.common.oauth.invalid_token',
-                     ('errors.com.epicgames.common.authentication.'
-                      'token_verification_failed'))
-            if exc.message_code in catch:
+            catch = (
+                'errors.com.epicgames.common.oauth.invalid_token',
+                ('errors.com.epicgames.common.authentication.'
+                 'token_verification_failed')
+            )
+            if exc.message_code in catch and not self.client._closing:
                 await self.client.restart()
                 return await self.fn_request(method, route, auth, graphql,
                                              **kwargs)
@@ -372,7 +371,7 @@ class HTTPClient:
                 return await self.fn_request(method, route, auth, graphql,
                                              **kwargs)
 
-            exc.reraise()
+            raise
 
     async def get(self, route: Union[Route, str],
                   auth: Optional[str] = None,
@@ -554,8 +553,8 @@ class HTTPClient:
             'x-xsrf-token': xsrf_token
         }
 
-        data = await self.get(EpicGames('/id/api/exchange'), headers=headers)
-        return json.loads(data)
+        r = EpicGames('/id/api/exchange/generate')
+        return await self.post(r, headers=headers)
 
     ###################################
     #          Entitlement            #
@@ -668,6 +667,14 @@ class HTTPClient:
         r = PaymentWebsite('/purchase/confirm-order')
         return await self.post(r, headers=headers, data=payload)
 
+    async def payment_website_search_sac_by_slug(self, slug: str) -> Any:
+        params = {
+            'slug': slug
+        }
+
+        r = PaymentWebsite('/affiliate/search-by-slug', auth=None)
+        return await self.get(r, params=params)
+
     ###################################
     #           Lightswitch           #
     ###################################
@@ -679,13 +686,17 @@ class HTTPClient:
         r = LightswitchPublicService('/lightswitch/api/service/bulk/status')
         return await self.get(r, params=params)
 
-    # NOTE: Will be deprecated by fortnite soon
-    async def get_by_display_name(self, display_name: str) -> Any:
+    ###################################
+    #           User Search           #
+    ###################################
+
+    async def user_search_by_prefix(self, prefix: str, platform: str) -> list:
         params = {
-            'q': display_name
+            'prefix': prefix,
+            'platform': platform
         }
 
-        r = PersonaPublicService('/persona/api/public/account/lookup')
+        r = ProfileSearchService('/api/v1/search')
         return await self.get(r, params=params)
 
     ###################################
@@ -705,13 +716,13 @@ class HTTPClient:
             '/account/api/public/account/{client_id}/deviceAuth',
             client_id=client_id
         )
-        return await self.post(r, auth="LAUNCHER_ACCESS_TOKEN", json={})
+        return await self.post(r, auth="IOS_ACCESS_TOKEN", json={})
 
     async def account_get_device_auths(self, client_id: str) -> list:
         r = AccountPublicService(
             '/account/api/public/account/{client_id}/deviceAuth',
             client_id=client_id,
-            auth="LAUNCHER_ACCESS_TOKEN"
+            auth="IOS_ACCESS_TOKEN"
         )
         return await self.get(r)
 
@@ -721,7 +732,7 @@ class HTTPClient:
             '/account/api/public/account/{client_id}/deviceAuth/{device_id}',
             client_id=client_id,
             device_id=device_id,
-            auth="LAUNCHER_ACCESS_TOKEN"
+            auth="IOS_ACCESS_TOKEN"
         )
         return await self.get(r)
 
@@ -731,7 +742,7 @@ class HTTPClient:
             '/account/api/public/account/{client_id}/deviceAuth/{device_id}',
             client_id=client_id,
             device_id=device_id,
-            auth="LAUNCHER_ACCESS_TOKEN"
+            auth="IOS_ACCESS_TOKEN"
         )
         return await self.delete(r)
 
@@ -740,13 +751,14 @@ class HTTPClient:
                                  token=token)
         return await self.delete(r, auth=auth)
 
-    async def account_sessions_kill(self, kill_type: str) -> Any:
+    async def account_sessions_kill(self, kill_type: str,
+                                    auth='IOS_ACCESS_TOKEN') -> Any:
         params = {
             'killType': kill_type
         }
 
         r = AccountPublicService('/account/api/oauth/sessions/kill')
-        return await self.delete(r, params=params)
+        return await self.delete(r, params=params, auth=auth)
 
     async def account_get_by_display_name(self, display_name: str) -> dict:
         r = AccountPublicService(
@@ -904,8 +916,7 @@ class HTTPClient:
 
     async def fortnitecontent_get(self) -> dict:
         r = FortniteContentWebsite('/content/api/pages/fortnite-game')
-        data = await self.get(r)
-        return json.loads(data)
+        return await self.get(r)
 
     ###################################
     #            Friends              #
@@ -935,6 +946,11 @@ class HTTPClient:
             client_id=self.client.user.id,
             user_id=user_id
         )
+        return await self.delete(r)
+
+    async def friends_remove_all(self) -> Any:
+        r = FriendsPublicService('/friends/api/v1/{client_id}/friends',
+                                 client_id=self.client.user.id)
         return await self.delete(r)
 
     async def friends_get_blocklist(self) -> list:
@@ -995,6 +1011,14 @@ class HTTPClient:
         )
         return await self.delete(r)
 
+    async def friends_get_mutual(self, user_id: str) -> Any:
+        r = FriendsPublicService(
+            '/friends/api/v1/{client_id}/friends/{user_id}/mutual',
+            client_id=self.client.user.id,
+            user_id=user_id
+        )
+        return await self.get(r)
+
     ###################################
     #            Presence             #
     ###################################
@@ -1002,7 +1026,7 @@ class HTTPClient:
     async def presence_get_last_online(self) -> dict:
         r = PresencePublicService('/presence/api/v1/_/{client_id}/last-online',
                                   client_id=self.client.user.id)
-        return json.loads(await self.get(r))
+        return await self.get(r)
 
     ###################################
     #              Stats              #
@@ -1013,9 +1037,9 @@ class HTTPClient:
                            end_time: Optional[int] = None) -> dict:
         params = {}
         if start_time:
-            params['start_time'] = start_time
+            params['startTime'] = start_time
         if end_time:
-            params['end_time'] = end_time
+            params['endTime'] = end_time
 
         r = StatsproxyPublicService(
             '/statsproxy/api/statsv2/account/{user_id}',
@@ -1053,10 +1077,11 @@ class HTTPClient:
     async def party_send_invite(self, party_id: str,
                                 user_id: str,
                                 send_ping: bool = True) -> Any:
+        conn_type = self.client.default_party_member_config.cls.CONN_TYPE
         payload = {
             'urn:epic:cfg:build-id_s': self.client.party_build_id,
             'urn:epic:conn:platform_s': self.client.platform.value,
-            'urn:epic:conn:type_s': 'game',
+            'urn:epic:conn:type_s': conn_type,
             'urn:epic:invite:platformdata_s': '',
             'urn:epic:member:dn_s': self.client.user.display_name,
         }
@@ -1072,15 +1097,24 @@ class HTTPClient:
         )
         return await self.post(r, json=payload, params=params)
 
-    # NOTE: Depracated since fortnite v11.30
-    #       Use param sendPing=True with send_invite
-    # async def party_send_ping(self, user_id):
-    #     r = PartyService(
-    #         '/party/api/v1/Fortnite/user/{user_id}/pings/{client_id}',
-    #         user_id=user_id,
-    #         client_id=self.client.user.id
-    #     )
-    #     return await self.post(r, json={})
+    async def party_delete_invite(self, party_id: str, user_id: str) -> Any:
+        r = PartyService(
+            '/party/api/v1/Fortnite/parties/{party_id}/invites/{user_id}',
+            party_id=party_id,
+            user_id=user_id
+        )
+        return await self.delete(r)
+
+    # NOTE: Depracated since fortnite v11.30. Use param sendPing=True with
+    #       send_invite
+    # NOTE: Now used for sending invites from private parties
+    async def party_send_ping(self, user_id: str) -> Any:
+        r = PartyService(
+            '/party/api/v1/Fortnite/user/{user_id}/pings/{client_id}',
+            user_id=user_id,
+            client_id=self.client.user.id
+        )
+        return await self.post(r, json={})
 
     async def party_delete_ping(self, user_id: str) -> Any:
         r = PartyService(
@@ -1135,17 +1169,18 @@ class HTTPClient:
         return await self.delete(r)
 
     async def party_leave(self, party_id: str) -> Any:
+        conn_type = self.client.default_party_member_config.cls.CONN_TYPE
         payload = {
             'connection': {
                 'id': self.client.user.jid,
                 'meta': {
                     'urn:epic:conn:platform_s': self.client.platform.value,
-                    'urn:epic:conn:type_s': 'game'
+                    'urn:epic:conn:type_s': conn_type,
                 },
             },
             'meta': {
                 'urn:epic:member:dn_s': self.client.user.display_name,
-                'urn:epic:member:type_s': 'game',
+                'urn:epic:member:type_s': conn_type,
                 'urn:epic:member:platform_s': self.client.platform.value,
                 'urn:epic:member:joinrequest_j': json.dumps({
                     'CrossplayPreference_i': '1'
@@ -1161,14 +1196,17 @@ class HTTPClient:
         return await self.delete(r, json=payload)
 
     async def party_join_request(self, party_id: str) -> Any:
+        conf = self.client.default_party_member_config
+        conn_type = conf.cls.CONN_TYPE
+        yield_leadership = conf.yield_leadership
         payload = {
             'connection': {
                 'id': str(self.client.xmpp.xmpp_client.local_jid),
                 'meta': {
                     'urn:epic:conn:platform_s': self.client.platform.value,
-                    'urn:epic:conn:type_s': 'game',
+                    'urn:epic:conn:type_s': conn_type,
                 },
-                'yield_leadership': False,
+                'yield_leadership': yield_leadership,
             },
             'meta': {
                 'urn:epic:member:dn_s': self.client.user.display_name,
@@ -1216,6 +1254,10 @@ class HTTPClient:
         return await self.get(r)
 
     async def party_create(self, config: dict) -> dict:
+        conf = self.client.default_party_member_config
+        conn_type = conf.cls.CONN_TYPE
+        yield_leadership = conf.yield_leadership
+
         _chat_enabled = str(config['chat_enabled']).lower()
         payload = {
             'config': {
@@ -1228,15 +1270,21 @@ class HTTPClient:
                     'id': str(self.client.xmpp.xmpp_client.local_jid),
                     'meta': {
                         'urn:epic:conn:platform_s': self.client.platform.value,
-                        'urn:epic:conn:type_s': 'game'
-                    }
-                }
+                        'urn:epic:conn:type_s': conn_type
+                    },
+                    'yield_leadership': yield_leadership,
+                },
             },
             'meta': {
-                'urn:epic:cfg:party-type-id_s': 'default',
+                'urn:epic:cfg:accepting-members_b': False,
                 'urn:epic:cfg:build-id_s': str(self.client.party_build_id),
-                'urn:epic:cfg:join-request-action_s': 'Manual',
+                'urn:epic:cfg:can-join_b': True,
                 'urn:epic:cfg:chat-enabled_b': _chat_enabled,
+                'urn:epic:cfg:invite-perm_s': 'Noone',
+                'urn:epic:cfg:join-request-action_s': 'Manual',
+                'urn:epic:cfg:not-accepting-members-reason_i': 0,
+                'urn:epic:cfg:party-type-id_s': 'default',
+                'urn:epic:cfg:presence-perm_s': 'Noone',
             }
         }
 
@@ -1245,12 +1293,16 @@ class HTTPClient:
 
     async def party_update_member_meta(self, party_id: str,
                                        user_id: str,
-                                       meta: dict,
-                                       revision: int) -> Any:
+                                       updated_meta: dict,
+                                       deleted_meta: list,
+                                       overridden_meta: dict,
+                                       revision: int,
+                                       override={}) -> Any:
         payload = {
-            'delete': [],
+            'delete': deleted_meta,
+            'update': updated_meta,
+            'override': overridden_meta,
             'revision': revision,
-            'update': meta
         }
 
         r = PartyService(
@@ -1264,6 +1316,7 @@ class HTTPClient:
     async def party_update_meta(self, party_id: str,
                                 updated_meta: dict,
                                 deleted_meta: list,
+                                overridden_meta: dict,
                                 config: dict,
                                 revision: int) -> Any:
         payload = {
@@ -1274,7 +1327,8 @@ class HTTPClient:
             },
             'meta': {
                 'delete': deleted_meta,
-                'update': updated_meta
+                'update': updated_meta,
+                'override': overridden_meta
             },
             'party_state_overridden': {},
             'party_privacy_type': config['joinability'],

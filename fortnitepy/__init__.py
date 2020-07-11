@@ -25,27 +25,25 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-__version__ = '1.5.5'
-
-import asyncio
-from sys import platform, version_info
+__version__ = '2.2.1'
 
 from .client import Client, run_multiple, start_multiple, close_multiple
-from .auth import (EmailAndPasswordAuth, ExchangeCodeAuth, DeviceAuth,
+from .auth import (Auth, EmailAndPasswordAuth, ExchangeCodeAuth,
+                   AuthorizationCodeAuth, DeviceAuth, RefreshTokenAuth,
                    AdvancedAuth)
-from .friend import Friend, PendingFriend
+from .friend import Friend, IncomingPendingFriend, OutgoingPendingFriend
 from .message import FriendMessage, PartyMessage
-from .party import (PartyMember, ClientPartyMember, Party, ClientParty,
-                    PartyInvitation, PartyJoinConfirmation)
+from .party import (DefaultPartyConfig, DefaultPartyMemberConfig, PartyMember,
+                    ClientPartyMember, JustChattingClientPartyMember, Party, 
+                    ClientParty, ReceivedPartyInvitation, SentPartyInvitation,
+                    PartyJoinConfirmation)
 from .presence import Presence, PresenceGameplayStats, PresenceParty
-from .user import ClientUser, User, BlockedUser, ExternalAuth
+from .user import (ClientUser, User, BlockedUser, ExternalAuth,
+                   ProfileSearchEntryUser, SacSearchEntryUser)
 from .stats import StatsV2
 from .enums import *
 from .errors import *
 from .store import Store, FeaturedStoreItem, DailyStoreItem
 from .news import BattleRoyaleNewsPost
 from .playlist import Playlist
-
-# fix for python 3.8
-if platform == 'win32' and version_info >= (3, 8):
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+from .kairos import Avatar

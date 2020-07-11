@@ -36,15 +36,19 @@ class FortniteException(Exception):
     pass
 
 
-class PurchaseException(FortniteException):
-    """This exception is raised if the game could not be purchased on
-    launch.
-    """
-
-
 class AuthException(FortniteException):
-    """This exception is raised when auth fails."""
-    pass
+    """This exception is raised when auth fails by invalid credentials
+    passed or some other misc failure.
+
+    Attributes
+    ----------
+    original: :exc:`FortniteException`
+        The original exception raised. The original error always inherits from
+        :exc:`FortniteException`.
+    """
+    def __init__(self, message, original):
+        super().__init__(message)
+        self.original = original
 
 
 class EventError(FortniteException):
@@ -81,6 +85,20 @@ class NotFound(FortniteException):
 class NoMoreItems(FortniteException):
     """This exception is raised whenever an iterator does not have any more
     items.
+    """
+    pass
+
+
+class DuplicateFriendship(FortniteException):
+    """This exception is raised whenever the client attempts to add a user as
+    friend when the friendship already exists."""
+    pass
+
+
+class FriendshipRequestAlreadySent(FortniteException):
+    """This exception is raised whenever the client attempts to send a friend
+    request to a user that has already received a friend request from the
+    client.
     """
     pass
 
@@ -166,9 +184,3 @@ class HTTPException(FortniteException):
         )
 
         super().__init__(self.text)
-
-    def reraise(self, from_none=False) -> None:
-        if not from_none:
-            raise self
-        else:
-            raise self from None
