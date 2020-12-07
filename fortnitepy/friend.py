@@ -89,16 +89,20 @@ class FriendBase(UserBase):
     @property
     def incoming(self) -> bool:
         """:class:`bool`: ``True`` if this friend was the one to send the
-        friend request else ``False``.
+        friend request else ``False`. Aliased to ``inbound`` as well.
         """
         return self._direction == 'INBOUND'
+
+    inbound = incoming
 
     @property
     def outgoing(self) -> bool:
         """:class:`bool`: ``True`` if the bot was the one to send the friend
-        request else ``False``.
+        request else ``False``. Aliased to ``outbound`` as well.
         """
         return self._direction == 'OUTBOUND'
+
+    outbound = outgoing
 
     @property
     def created_at(self) -> datetime.datetime:
@@ -243,6 +247,39 @@ class Friend(FriendBase):
         if pres is None:
             return False
         return pres.available
+
+    def _online_check(self, available):
+        def check(b, a):
+            if a.friend.id != self.id:
+                return False
+            return a.available is available
+        return check
+
+    async def wait_until_online(self) -> None:
+        """|coro|
+
+        Waits until this friend comes online. Returns instantly if already
+        online.
+        """
+        pres = self.last_presence
+        if pres is None or pres.available is False:
+            pres = await self.client.wait_for(
+                'friend_presence',
+                check=self._online_check(available=True)
+            )
+
+    async def wait_until_offline(self) -> None:
+        """|coro|
+
+        Waits until this friend goes offline. Returns instantly if already
+        offline.
+        """
+        pres = self.last_presence
+        if pres is not None and pres.available is not False:
+            pres = await self.client.wait_for(
+                'friend_presence',
+                check=self._online_check(available=False)
+            )
 
     async def fetch_last_logout(self) -> Optional[datetime.datetime]:
         """|coro|
@@ -526,7 +563,8 @@ class OutgoingPendingFriend(PendingFriendBase):
     async def cancel(self) -> None:
         """|coro|
 
-        Cancel the friend request sent to this user.
+        Cancel the friend request sent to this user. This method is also
+        aliases to ``abort()``.
 
         Raises
         ------
@@ -534,3 +572,5 @@ class OutgoingPendingFriend(PendingFriendBase):
             Something went wrong when trying to cancel this request.
         """
         await self.client.remove_or_decline_friend(self.id)
+
+    abort = cancel

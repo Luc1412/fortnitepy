@@ -22,7 +22,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-import random
 import json
 
 from typing import List, Optional, Dict, Any, Union
@@ -31,18 +30,10 @@ from .enums import DefaultCharactersChapter1, KairosBackgroundColorPreset
 ListOrPreset = Optional[Union[List[str], KairosBackgroundColorPreset]]
 
 
-def get_random_chapter1_default_cid() -> str:
-    return (random.choice(list(DefaultCharactersChapter1))).name
-
-
-def get_random_color_preset() -> List[str]:
-    return (random.choice(list(KairosBackgroundColorPreset))).value
-
-
 def get_random_default_avatar() -> 'Avatar':
     return Avatar(
-        asset=get_random_chapter1_default_cid(),
-        background_colors=get_random_color_preset()
+        asset=DefaultCharactersChapter1.get_random_name(),
+        background_colors=KairosBackgroundColorPreset.get_random_value()
     )
 
 
@@ -66,6 +57,9 @@ class Avatar:
     background: Optional[Union[List[:class:`str`], :class:`KairosBackgroundColorPreset`]]
         A list of exactly three hex color values represented as strings.
     """  # noqa
+
+    __slots__ = ('asset', 'background_colors')
+
     def __init__(self, *, asset: Optional[str] = None,
                  background_colors: ListOrPreset = None) -> None:
         self.asset = asset
@@ -78,6 +72,12 @@ class Avatar:
     def __repr__(self) -> str:
         return ('<Avatar asset={0.asset!r} '
                 'background_colors={0.background_colors!r}>'.format(self))
+
+    def __eq__(self, other):
+        return isinstance(other, Avatar) and other.to_dict() == self.to_dict()
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts it into a fortnite friendly dict.

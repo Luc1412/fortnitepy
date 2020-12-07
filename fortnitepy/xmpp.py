@@ -34,6 +34,7 @@ import itertools
 import unicodedata
 import aiohttp
 
+from xml.etree import ElementTree
 from collections import defaultdict
 from typing import TYPE_CHECKING, Optional, Union, Awaitable, Any, Tuple
 
@@ -68,9 +69,34 @@ class EventContext:
 class EventDispatcher:
     def __init__(self) -> None:
         self._listeners = defaultdict(list)
+        self._presence_listeners = []
         self.interactions_enabled = False
 
-    def process_event(self, client: 'Client', body: dict) -> None:
+    def process_presence(self, client, *args) -> None:
+        for coro in self._presence_listeners:
+            if __name__ == coro.__module__:
+                asyncio.ensure_future(coro(client.xmpp, *args))
+            else:
+                asyncio.ensure_future(coro(*args))
+
+    def presence(self) -> Awaitable:
+        def decorator(coro: Awaitable) -> Awaitable:
+            self.add_presence_handler(coro)
+            return coro
+        return decorator
+
+    def add_presence_handler(self, coro: Awaitable) -> None:
+        if coro not in self._presence_listeners:
+            self._presence_listeners.append(coro)
+
+    def remove_presence_handler(self, coro: Awaitable) -> None:
+        self._presence_listeners = [
+            c for c in self._presence_listeners if c is not coro
+        ]
+
+    def process_event(self, client: 'Client', raw_body: dict) -> None:
+        body = json.loads(raw_body)
+
         type_ = body.get('type')
         if type_ is None:
             if self.interactions_enabled:
@@ -111,44 +137,171 @@ class EventDispatcher:
 dispatcher = EventDispatcher()
 
 
+class XMLProcessor:
+    def _process_presence(self, raw: str) -> Optional[Union[tuple, bool]]:
+        tree = ElementTree.fromstring(raw)
+
+        type_ = tree.get('type')
+
+        # Only intercept presences with either no type attribute
+        # (which means available) or unavailable type.
+        if type_ is not None and type_ not in ('available', 'unavailable'):
+            return False
+
+        from_ = tree.get('from')
+
+        # If from is a party, let aioxmpp handle it.
+        if from_ is not None and '-' in from_:
+            return False
+
+        status = None
+        show = None
+        for elem in tree:
+            if 'status' in elem.tag:
+                status = elem.text
+            if 'show' in elem.tag:
+                show = elem.text
+
+        # We have no use for the presence if status is None and
+        # therefore it's better to just let aioxmpp handle it.
+        if status is None:
+            return False
+
+        split = from_.split('@')
+        user_id = split[0]
+        platform = split[1].split(':')[2]
+
+        return 'presence', (user_id, platform, type_, status, show)
+
+    def _process_message(self, raw: str) -> Optional[Union[tuple, bool]]:
+        tree = ElementTree.fromstring(raw)
+
+        type_ = tree.get('type')
+
+        # Only intercept messages with either no type attribute
+        # (which means normal) or  type.
+        if type_ is not None and type_ != 'normal':
+            return False
+
+        # Let aioxmpp handle it if no body tag is found. Also, technically
+        # a message can include multiple body tags for different languages
+        # but afaik only one body tag is sent from epics servers.
+        body = None
+        for elem in tree:
+            if 'body' in elem.tag:
+                body = elem.text
+                break
+        else:
+            return False
+
+        return 'message', (body,)
+
+    def process(self, raw: str) -> Optional[Union[tuple, bool]]:
+        # Yes, this is a hacky solution but it's better than
+        # using the quite unnecessary slow aioxmpp one.
+        if '<presence' in raw:
+            return self._process_presence(raw)
+        elif '<message' in raw:
+            return self._process_message(raw)
+
+        return False
+
+
 class WebsocketTransport:
     def __init__(self, loop: asyncio.AbstractEventLoop,
                  stream: 'WebsocketXMLStream',
-                 logger: logging.Logger) -> None:
+                 client: 'Client',
+                 logger: logging.Logger,
+                 ws_connector: Optional[aiohttp.BaseConnector] = None) -> None:
         self.loop = loop
         self.stream = stream
+        self.client = client
         self.logger = logger
+        self.ws_connector = ws_connector
+
+        self.xml_processor = XMLProcessor()
 
         self.connection = None
         self._buffer = b''
         self._reader_task = None
         self._close_event = asyncio.Event()
+        self._called_lost = False
+        self._attempt_reconnect = True
 
     async def create_connection(self, *args,
                                 **kwargs) -> aiohttp.ClientWebSocketResponse:
-        self.session = aiohttp.ClientSession()
+        self.logger.debug('Setting up new websocket connection.')
+
+        self.session = aiohttp.ClientSession(
+            connector=self.ws_connector,
+            connector_owner=self.ws_connector is None,
+        )
         self.connection = con = await self.session.ws_connect(
             *args, **kwargs
         )
+
         self.loop.create_task(self.reader())
         self.stream.connection_made(self)
+        self._called_lost = False
+        self._attempt_reconnect = True
+
         self.logger.debug('Websocket connection established.')
         return con
 
     async def reader(self) -> None:
         self.logger.debug('Websocket reader is now running.')
 
-        while True:
-            msg = await self.connection.receive()
+        try:
+            while True:
+                msg = await self.connection.receive()
 
-            if msg.type == aiohttp.WSMsgType.text:
-                self.stream.data_received(msg.data)
-            if msg.type == aiohttp.WSMsgType.closed:
-                break
-            if msg.type == aiohttp.WSMsgType.error:
-                break
+                self.logger.debug('RECV: {0}'.format(msg))
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    ret = self.xml_processor.process(msg.data)
+                    if ret is None:
+                        continue
+                    elif ret is False:
+                        self.stream.data_received(msg.data)
+                    else:
+                        type_ = ret[0]
+                        if type_ == 'presence':
+                            dispatcher.process_presence(
+                                self.client,
+                                *ret[1]
+                            )
+                        elif type_ == 'message':
+                            dispatcher.process_event(
+                                self.client,
+                                *ret[1]
+                            )
+
+                if msg.type == aiohttp.WSMsgType.CLOSED:
+                    if self._attempt_reconnect:
+                        err = ConnectionError(
+                            'websocket stream closed by peer'
+                        )
+                    else:
+                        err = None
+
+                    if not self._called_lost:
+                        self._called_lost = True
+                        self.stream.connection_lost(err)
+                    break
+
+                if msg.type == aiohttp.WSMsgType.ERROR:
+                    if not self._called_lost:
+                        self._called_lost = True
+                        self.stream.connection_lost(
+                            ConnectionError(
+                                'websocket stream received an error: '
+                                '{0}'.format(self.connection.exception()))
+                        )
+                    break
+        finally:
+            self.logger.debug('Websocket reader stopped.')
 
     async def send(self, data: bytes) -> None:
+        self.logger.debug('SEND: {0}'.format(data))
         await self.connection.send_bytes(data)
 
     def write(self, data: bytes) -> None:
@@ -156,7 +309,7 @@ class WebsocketTransport:
 
     def flush(self) -> None:
         if self._buffer:
-            asyncio.ensure_future(self.send(self._buffer), loop=self.loop)
+            asyncio.ensure_future(self.send(self._buffer))
 
         self._buffer = b''
 
@@ -164,7 +317,7 @@ class WebsocketTransport:
         return False
 
     def write_eof(self) -> None:
-        raise NotImplementedError("Cannot write_eof() on ws transport")
+        raise NotImplementedError("Cannot write_eof() on ws transport.")
 
     def _stop_reader(self) -> None:
         if self._reader_task is not None and not self._reader_task.cancelled():
@@ -174,12 +327,6 @@ class WebsocketTransport:
         self._close_event.set()
 
     def on_close(self, *args) -> None:
-        # We do this to make sure connection_lost() doesnt re-call
-        # _writer.abort().
-        self.stream._writer = None
-
-        self.stream.connection_lost(None)
-
         try:
             task = self.loop.create_task(self.session.close())
         except AttributeError:
@@ -187,14 +334,24 @@ class WebsocketTransport:
         else:
             task.add_done_callback(self.close_callback)
 
-    def close(self) -> None:
+    def _close(self) -> None:
         if not self.connection:
             raise RuntimeError('Cannot close a non-existing connection.')
+
+        self.logger.debug('Closing websocket connection.')
 
         task = self.loop.create_task(self.connection.close())
         task.add_done_callback(self.on_close)
 
         self._stop_reader()
+
+    def close(self) -> None:
+        self._attempt_reconnect = False
+        self._close()
+
+    def abort(self) -> None:
+        self.logger.debug('Received abort signal.')
+        self._close()
 
     async def wait_closed(self) -> None:
         await self._close_event
@@ -246,6 +403,10 @@ class WebsocketXMLStream(aioxmpp.protocol.XMLStream):
 
 
 class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
+    def __init__(self, client, ws_connector=None):
+        self.client = client
+        self.ws_connector = ws_connector
+
     @property
     def tls_supported(self) -> bool:
         return False
@@ -264,7 +425,7 @@ class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
                       ) -> Tuple[WebsocketTransport,
                                  WebsocketXMLStream,
                                  aioxmpp.nonza.StreamFeatures]:
-        features_future = asyncio.Future(loop=loop)
+        features_future = asyncio.Future()
 
         stream = WebsocketXMLStream(
             to=domain,
@@ -282,7 +443,9 @@ class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
         transport = WebsocketTransport(
             loop,
             stream,
+            self.client,
             logger,
+            ws_connector=self.ws_connector
         )
         await transport.create_connection(
             'wss://{host}'.format(host=host),
@@ -293,15 +456,44 @@ class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
         return transport, stream, await features_future
 
 
+# Were just patching this method to suppress an exception
+# which is raised on stream error.
+def _patched_done_handler(self, task):
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as err:
+        try:
+            if self._sm_enabled:
+                self._xmlstream.abort()
+            else:
+                self._xmlstream.close()
+        except Exception:
+            pass
+        self.on_failure(err)
+
+
+aioxmpp.stream.StanzaStream._done_handler = _patched_done_handler
+
+
 class XMPPClient:
-    def __init__(self, client: 'Client') -> None:
+    def __init__(self, client: 'Client', ws_connector=None) -> None:
         self.client = client
+        self.ws_connector = ws_connector
 
         self.xmpp_client = None
         self.stream = None
-        self._ping_task = None
-        self._task = None
         self.muc_room = None
+
+        self._ping_task = None
+        self._is_suspended = False
+        self._reconnect_recover_task = None
+        self._last_disconnected_at = None
+        self._last_known_party_id = None
+        self._task = None
+
+        self.send_presence_on_add = True
 
     def jid(self, user_id: str) -> aioxmpp.JID:
         return aioxmpp.JID.fromstr('{}@{}'.format(
@@ -310,12 +502,18 @@ class XMPPClient:
         ))
 
     def _remove_illegal_characters(self, chars: str) -> str:
+        fixed = []
         for c in chars:
+            try:
+                aioxmpp.stringprep.resourceprep(c)
+            except ValueError:
+                continue
+
             if is_RandALCat(c):
-                chars = chars.replace(c, '')
-            if ord(c) in (0,):
-                chars = chars.replace(c, '')
-        return chars
+                continue
+
+            fixed.append(c)
+        return ''.join(fixed)
 
     def _create_invite(self, from_id: str, data: dict) -> dict:
         sent_at = self.client.from_iso(data['sent'])
@@ -356,7 +554,18 @@ class XMPPClient:
         return inv
 
     async def process_chat_message(self, message: aioxmpp.Message) -> None:
-        author = self.client.get_friend(message.from_.localpart)
+        user_id = message.from_.localpart
+        author = self.client.get_friend(user_id)
+        if author is None:
+            try:
+                author = await self.client.wait_for(
+                    'friend_add',
+                    check=lambda f: f.id == user_id,
+                    timeout=2
+                )
+            except asyncio.TimeoutError:
+                log.debug('Friend message discarded because friend not found.')
+                return
 
         try:
             m = FriendMessage(
@@ -381,7 +590,7 @@ class XMPPClient:
 
             data = self.client.get_user(_id)
             if data is None:
-                data = await self.client.fetch_profile(_id, raw=True)
+                data = await self.client.fetch_user(_id, raw=True)
             else:
                 data = data.get_raw()
 
@@ -399,16 +608,26 @@ class XMPPClient:
             })
 
             try:
-                self.client._pending_friends.remove(f.id)
+                del self.client._pending_friends[f.id]
             except KeyError:
                 pass
+
+            # Send presence to the newly added friend as that is now
+            # required to do by the server (or at least thats what
+            # i suspect)
+            if self.send_presence_on_add:
+                self.client.loop.create_task(self.send_presence(
+                    to=f.jid,
+                    status=self.client.party.last_raw_status,
+                    show=self.client.away.value
+                ))
 
             self.client.dispatch_event('friend_add', f)
 
         elif _status == 'PENDING':
             data = self.client.get_user(_id)
             if data is None:
-                data = await self.client.fetch_profile(_id, raw=True)
+                data = await self.client.fetch_user(_id, raw=True)
             else:
                 data = data.get_raw()
 
@@ -436,23 +655,40 @@ class XMPPClient:
 
         if body['reason'] == 'ABORTED':
             pf = self.client.get_pending_friend(_id)
-            self.client.store_user(pf.get_raw())
-            self.client._pending_friends.remove(pf.id)
-            self.client.dispatch_event('friend_request_abort', pf)
+            if pf is not None:
+                self.client.store_user(pf.get_raw())
+
+                try:
+                    del self.client._pending_friends[pf.id]
+                except KeyError:
+                    pass
+
+                self.client.dispatch_event('friend_request_abort', pf)
         elif body['reason'] == 'REJECTED':
             pf = self.client.get_pending_friend(_id)
-            self.client.store_user(pf.get_raw())
-            self.client._pending_friends.remove(pf.id)
-            self.client.dispatch_event('friend_request_decline', pf)
+            if pf is not None:
+                self.client.store_user(pf.get_raw())
+
+                try:
+                    del self.client._pending_friends[pf.id]
+                except KeyError:
+                    pass
+
+                self.client.dispatch_event('friend_request_decline', pf)
         else:
             f = self.client.get_friend(_id)
             if f is not None:
                 self.client.store_user(f.get_raw())
-                self.client._friends.remove(f.id)
+
+                try:
+                    del self.client._friends[f.id]
+                except KeyError:
+                    pass
+
                 self.client.dispatch_event('friend_remove', f)
 
         try:
-            self.client._presences.remove(_id)
+            del self.client._presences[_id]
         except KeyError:
             pass
 
@@ -461,7 +697,7 @@ class XMPPClient:
         body = ctx.body
 
         account_id = body['payload']['accountId']
-        data = await self.client.fetch_profile(account_id, raw=True)
+        data = await self.client.fetch_user(account_id, raw=True)
         blocked_user = self.client.store_blocked_user(data)
         self.client.dispatch_event('user_block', blocked_user)
 
@@ -470,9 +706,14 @@ class XMPPClient:
         body = ctx.body
 
         account_id = body['payload']['accountId']
-        profile = await self.client.fetch_profile(account_id)
-        self.client._blocked_users.remove(profile.id)
-        self.client.dispatch_event('user_unblock', profile)
+        user = await self.client.fetch_user(account_id)
+
+        try:
+            del self.client._blocked_users[user.id]
+        except KeyError:
+            pass
+
+        self.client.dispatch_event('user_unblock', user)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.PING')
     async def event_ping_received(self, ctx: EventContext) -> None:
@@ -480,14 +721,17 @@ class XMPPClient:
         pinger = body['pinger_id']
         try:
             data = (await self.client.http.party_lookup_ping(pinger))[0]
-        except IndexError:
-            return
-        except HTTPException as exc:
-            m = 'errors.com.epicgames.social.party.ping_not_found'
-            if exc.message_code == m:
-                return
+        except (IndexError, HTTPException) as exc:
+            if isinstance(exc, HTTPException):
+                m = 'errors.com.epicgames.social.party.ping_not_found'
+                if exc.message_code != m:
+                    raise
 
-            raise
+            self.client.dispatch_event(
+                'invalid_party_invite',
+                self.client.get_friend(pinger)
+            )
+            return
 
         for inv in data['invites']:
             if inv['sent_by'] == pinger and inv['status'] == 'SENT':
@@ -505,7 +749,7 @@ class XMPPClient:
                 net_cl = self.client.net_cl
         else:
             s = invite['meta']['urn:epic:cfg:build-id_s']
-            net_cl = s[4:] if s.startswith('1:1:') else s
+            net_cl = s[4:] if s.startswith('1:') else s
 
         if net_cl != self.client.net_cl and self.client.net_cl != '':
             log.debug(
@@ -531,7 +775,7 @@ class XMPPClient:
 
         user_id = body.get('account_id')
         if user_id != self.client.user.id:
-            await self.client._join_party_lock.wait()
+            await self.client.wait_until_party_ready()
 
         party = self.client.party
 
@@ -541,22 +785,22 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(user_id)
-        if member is None:
-            member = party._create_member(body)
+        if user_id == self.client.user.id:
+            await self.client._internal_join_party_lock.wait()
 
-            if member.id == self.client.user.id:
-                party._create_clientmember(body)
+        member = party.get_member(user_id)
+        if member is None:
+            member = (await party._update_members(
+                (body,),
+                remove_missing=False
+            ))[0]
 
         if party.me is not None:
             party.me.do_on_member_join_patch()
 
-        yielding = party.me._default_config.yield_leadership
-        if party.me and party.me.leader and not yielding:
-            fut = asyncio.ensure_future(
-                party.refresh_squad_assignments(),
-                loop=self.client.loop
-            )
+            yielding = party.me._default_config.yield_leadership
+            if party.me.leader and not yielding:
+                fut = asyncio.ensure_future(party.refresh_squad_assignments())
 
         try:
             if member.id == self.client.user.id:
@@ -594,7 +838,7 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(user_id)
+        member = party.get_member(user_id)
         if member is None:
             return
 
@@ -604,37 +848,6 @@ class XMPPClient:
             await party.refresh_squad_assignments()
 
         self.client.dispatch_event('party_member_leave', member)
-
-    @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_EXPIRED')  # noqa
-    async def event_party_member_expired(self, ctx: EventContext) -> None:
-        body = ctx.body
-
-        user_id = body.get('account_id')
-        if user_id != self.client.user.id:
-            await self.client._join_party_lock.wait()
-
-        party = self.client.party
-
-        if party is None:
-            return
-
-        if party.id != body.get('party_id'):
-            return
-
-        member = party.members.get(user_id)
-        if member is None:
-            return
-
-        party._remove_member(member.id)
-
-        if party.me and party.me.leader and member.id != party.me.id:
-            await party.refresh_squad_assignments()
-
-        if member.id == self.client.user.id:
-            p = await self.client._create_party()
-            self.client.party = p
-
-        self.client.dispatch_event('party_member_expire', member)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_KICKED')  # noqa
     async def event_party_member_kicked(self, ctx: EventContext) -> None:
@@ -652,7 +865,7 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(user_id)
+        member = party.get_member(user_id)
         if member is None:
             return
 
@@ -672,6 +885,41 @@ class XMPPClient:
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_DISCONNECTED')  # noqa
     async def event_party_member_disconnected(self, ctx: EventContext) -> None:
         body = ctx.body
+        user_id = body.get('account_id')
+
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
+
+        if party is None:
+            return
+
+        if party.id != body.get('party_id'):
+            return
+
+        member = party.get_member(user_id)
+        if member is None:
+            return
+
+        # Dont continue processing for old connections
+        data = await self.client.http.party_lookup(party.id)
+        for member_data in data['members']:
+            if member_data['account_id'] == user_id:
+                connections = member_data['connections']
+                if len(connections) == 1:
+                    break
+
+                for connection in connections:
+                    if 'disconnected_at' not in connection:
+                        return
+
+        member._update_connection(body.get('connection'))
+        self.client.dispatch_event('party_member_zombie', member)
+
+    @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_EXPIRED')  # noqa
+    async def event_party_member_expired(self, ctx: EventContext) -> None:
+        body = ctx.body
 
         user_id = body.get('account_id')
         if user_id != self.client.user.id:
@@ -685,7 +933,7 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(user_id)
+        member = party.get_member(user_id)
         if member is None:
             return
 
@@ -694,7 +942,37 @@ class XMPPClient:
         if party.me and party.me.leader and member.id != party.me.id:
             await party.refresh_squad_assignments()
 
-        self.client.dispatch_event('party_member_disconnect', member)
+        if member.id == self.client.user.id:
+            p = await self.client._create_party()
+            self.client.party = p
+
+        self.client.dispatch_event('party_member_expire', member)
+
+    @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_CONNECTED')  # noqa
+    async def event_party_member_connected(self, ctx: EventContext) -> None:
+        body = ctx.body
+
+        user_id = body.get('account_id')
+        if user_id != self.client.user.id:
+            await self.client._join_party_lock.wait()
+
+        party = self.client.party
+
+        if party is None:
+            return
+
+        if party.id != body.get('party_id'):
+            return
+
+        member = party.get_member(user_id)
+        if member is None:
+            return
+
+        member._update_connection(body.get('connection'))
+        if member.id == self.client.user.id:
+            party.update_presence()
+
+        self.client.dispatch_event('party_member_reconnect', member)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_NEW_CAPTAIN')  # noqa
     async def event_party_new_captain(self, ctx: EventContext) -> None:
@@ -713,17 +991,12 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(user_id)
+        member = party.get_member(user_id)
         if member is None:
             return
 
         old_leader = party.leader
-        for m in party.members.values():
-            m.update_role(None)
-
-        member.update_role('CAPTAIN')
-        if member.id == self.client.user.id:
-            self.client.party.me.update_role('CAPTAIN')
+        party._update_roles(member)
 
         party.update_presence()
         self.client.dispatch_event('party_member_promote', old_leader, member)
@@ -784,7 +1057,7 @@ class XMPPClient:
         if party.id != body.get('party_id'):
             return
 
-        member = party.members.get(user_id)
+        member = party.get_member(user_id)
         if member is None:
             def check(m):
                 return m.id == user_id
@@ -793,14 +1066,27 @@ class XMPPClient:
                 member = await self.client.wait_for(
                     'party_member_join',
                     check=check,
-                    timeout=3
+                    timeout=1
                 )
             except asyncio.TimeoutError:
-                if user_id == self.client.user.id:
-                    await party._leave()
-                    p = await self.client._create_party()
-                    self.client.party = p
-                return
+                party_data = await self.client.http.party_lookup(party.id)
+                for m_data in party_data['members']:
+                    if user_id == m_data['account_id']:
+                        member = (await party._update_members(
+                            (m_data,),
+                            remove_missing=False
+                        ))[0]
+                        break
+                else:
+                    if user_id == self.client.user.id:
+                        await party._leave()
+                        p = await self.client._create_party()
+                        self.client.party = p
+                    return
+
+                yielding = party.me._default_config.yield_leadership
+                if party.me and party.me.leader and not yielding:
+                    await party.refresh_squad_assignments()
 
         def _getattr(member, key):
             value = getattr(member, key)
@@ -810,12 +1096,11 @@ class XMPPClient:
 
         check = ('ready', 'input', 'assisted_challenge', 'outfit', 'backpack',
                  'pet', 'pickaxe', 'contrail', 'emote', 'emoji', 'banner',
-                 'battlepass_info', 'in_match', 'match_players_left')
+                 'battlepass_info', 'in_match', 'match_players_left',
+                 'enlightenments', 'corruption', 'outfit_variants',
+                 'backpack_variants', 'pickaxe_variants', 'contrail_variants')
         pre_values = {k: _getattr(member, k) for k in check}
 
-        check_variants = ('outfit_variants', 'backpack_variants',
-                          'pickaxe_variants', 'contrail_variants')
-        pre_variants_values = {k: _getattr(member, k) for k in check_variants}
         member.update(body)
 
         if party._default_config.team_change_allowed or not party.me.leader:
@@ -842,7 +1127,7 @@ class XMPPClient:
                         try:
                             self.client.dispatch_event(
                                 'party_member_team_swap',
-                                *[party.members[k] for k in new_positions]
+                                *[party._members[k] for k in new_positions]
                             )
                         except KeyError:
                             pass
@@ -857,20 +1142,20 @@ class XMPPClient:
                 value
             )
 
+        def compare(a, b):
+            def construct_set(v):
+                return set(itertools.chain(
+                    *[list(x.values()) if isinstance(x, dict) else (x,)
+                      for x in v]
+                ))
+
+            if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+                return construct_set(a) == construct_set(b)
+            return a == b
+
         for key, pre_value in pre_values.items():
             value = _getattr(member, key)
-
-            if pre_value != value:
-                _dispatch(key, member, pre_value, value)
-
-        def compare_variants(a, b):
-            def construct_set(v):
-                return set(itertools.chain(*[list(x.values()) for x in v]))
-            return construct_set(a) == construct_set(b)
-
-        for key, pre_value in pre_variants_values.items():
-            value = _getattr(member, key)
-            if not compare_variants(pre_value, value):
+            if not compare(pre_value, value):
                 _dispatch(key, member, pre_value, value)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_REQUIRE_CONFIRMATION')  # noqa
@@ -893,9 +1178,14 @@ class XMPPClient:
 
         user = self.client.get_user(user_id)
         if user is None:
-            user = await self.client.fetch_profile(user_id)
+            user = await self.client.fetch_user(user_id)
 
         confirmation = PartyJoinConfirmation(self.client, party, user, body)
+
+        # Automatically confirm if event is received but no handler is found.
+        if not self.client._event_has_destination('party_member_confirm'):
+            return await confirmation.confirm()
+
         self.client.dispatch_event('party_member_confirm', confirmation)
 
     @dispatcher.event('com.epicgames.social.party.notification.v0.INVITE_DECLINED')  # noqa
@@ -906,19 +1196,14 @@ class XMPPClient:
         if friend is not None:
             self.client.dispatch_event('party_invite_decline', friend)
 
-    async def process_presence(self, presence: aioxmpp.Presence) -> None:
-        user_id = presence.from_.localpart
-        if user_id == self.client.user.id or not presence.status:
-            return
-
-        if '-' in user_id:
-            return
-
-        if not presence.type_.is_presence_state:
-            return
-
+    @dispatcher.presence()
+    async def process_presence(self, user_id: str,
+                               platform: str,
+                               type_: str,
+                               status: str,
+                               show: str) -> None:
         try:
-            data = json.loads(presence.status.any())
+            data = json.loads(status)
 
             # We do this to filter out kairos from launcher presences
             ch = data.get('bIsEmbedded', False) or data.get('Status', '') != ''
@@ -940,14 +1225,10 @@ class XMPPClient:
             except asyncio.TimeoutError:
                 return
 
-        platform = None
-        if not presence.from_.is_bare:
-            platform = presence.from_.resource.split(':')[2]
-
-        is_available = presence.type_ is aioxmpp.PresenceType.AVAILABLE
+        is_available = type_ is None or type_ == 'available'
 
         try:
-            away = AwayStatus(presence.show)
+            away = AwayStatus(show)
         except ValueError:
             away = AwayStatus.ONLINE
 
@@ -972,16 +1253,72 @@ class XMPPClient:
 
         if not is_available and friend.is_online():
             friend._update_last_logout(datetime.datetime.utcnow())
-            self.client._presences.remove(user_id, None)
+
+            try:
+                del self.client._presences[user_id]
+            except KeyError:
+                pass
+
         else:
-            self.client._presences.set(user_id, _pres)
+            self.client._presences[user_id] = _pres
 
         self.client.dispatch_event('friend_presence', before_pres, _pres)
 
-    def setup_callbacks(self,
-                        messages: bool = True,
-                        process_messages: bool = True,
-                        presences: bool = True) -> None:
+    def on_stream_established(self):
+        self.client.dispatch_event('xmpp_session_establish')
+
+        async def on_establish():
+            # Just incase the recover task hangs we don't want it
+            # running forever in the background until a new close is
+            # dispatched potentially fucking shit up big time.
+            task = self._reconnect_recover_task
+            if task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(task, timeout=20)
+                except asyncio.TimeoutError:
+                    pass
+
+        if self._is_suspended:
+            self.client.dispatch_event('xmpp_session_reconnect')
+            self.client.loop.create_task(self.client._reconnect_to_party())
+
+        self._is_suspended = False
+        self.client.loop.create_task(on_establish())
+
+    def on_stream_suspended(self, reason):
+        jid = self.xmpp_client.local_jid
+        resource = jid.resource[:-32] + (uuid.uuid4().hex).upper()
+        self.xmpp_client._local_jid = jid.replace(resource=resource)
+
+        def on_events_recovered(*args):
+            self._reconnect_recover_task = None
+
+        self._reconnect_recover_task = task = self.client.loop.create_task(
+            self.client.recover_events(
+                refresh_caches=True,
+                wait_for_close=False
+            )
+        )
+        task.add_done_callback(on_events_recovered)
+
+        if self.client.party is not None:
+            self._last_known_party_id = self.client.party.id
+
+        self._is_suspended = True
+        self.client.dispatch_event('xmpp_session_lost')
+
+    def on_stream_destroyed(self, reason=None):
+        if not self._is_suspended:
+            task = self._reconnect_recover_task
+            if task is not None and not task.cancelled():
+                task.cancel()
+
+        self._last_disconnected_at = datetime.datetime.utcnow()
+        self.client.dispatch_event('xmpp_session_close')
+
+    def setup_callbacks(self, messages: bool = True) -> None:
+        client = self.xmpp_client
+
         message_dispatcher = self.xmpp_client.summon(
             aioxmpp.dispatcher.SimpleMessageDispatcher
         )
@@ -991,34 +1328,13 @@ class XMPPClient:
                 aioxmpp.MessageType.CHAT,
                 None,
                 lambda m: asyncio.ensure_future(
-                    self.process_chat_message(m),
-                    loop=self.client.loop
+                    self.process_chat_message(m)
                 ),
             )
 
-        if process_messages:
-            message_dispatcher.register_callback(
-                aioxmpp.MessageType.NORMAL,
-                None,
-                lambda m: dispatcher.process_event(
-                    self.client,
-                    json.loads(m.body.any())
-                )
-            )
-
-        if presences:
-            presence_dispatcher = self.xmpp_client.summon(
-                aioxmpp.dispatcher.SimplePresenceDispatcher,
-            )
-
-            presence_dispatcher.register_callback(
-                None,
-                None,
-                lambda m: asyncio.ensure_future(
-                    self.process_presence(m),
-                    loop=self.client.loop
-                ),
-            )
+        client.on_stream_established.connect(self.on_stream_established)
+        client.on_stream_suspended.connect(self.on_stream_suspended)
+        client.on_stream_destroyed.connect(self.on_stream_destroyed)
 
     async def loop_ping(self) -> None:
         while True:
@@ -1033,8 +1349,8 @@ class XMPPClient:
     async def _run(self, future: asyncio.Future) -> None:
         async with self.xmpp_client.connected() as stream:
             self.stream = stream
-            stream.soft_timeout = datetime.timedelta(minutes=5)
-            stream.round_trip_time = datetime.timedelta(minutes=5)
+            stream.soft_timeout = datetime.timedelta(minutes=3)
+            stream.round_trip_time = datetime.timedelta(minutes=3)
             future.set_result(None)
             while True:
                 await asyncio.sleep(1)
@@ -1059,34 +1375,29 @@ class XMPPClient:
             override_peer=[(
                 self.client.service_domain,
                 self.client.service_port,
-                XMPPOverWebsocketConnector()
+                XMPPOverWebsocketConnector(
+                    self.client,
+                    ws_connector=self.ws_connector
+                )
             )],
             loop=self.client.loop
         )
+        self.xmpp_client.backoff_start = datetime.timedelta(seconds=0.1)
+
         self.muc_service = self.xmpp_client.summon(aioxmpp.MUCClient)
         self.setup_callbacks()
 
         future = self.client.loop.create_future()
-        self._task = asyncio.ensure_future(self._run(future),
-                                           loop=self.client.loop)
+        self._task = asyncio.ensure_future(self._run(future))
         await future
-        self._ping_task = asyncio.ensure_future(self.loop_ping(),
-                                                loop=self.client.loop)
 
-        asyncio.ensure_future(self.send_presence_on_start(),
-                              loop=self.client.loop)
-        self.client.dispatch_event('xmpp_session_establish')
-
-    async def send_presence_on_start(self) -> None:
-        await self.client.wait_until_ready()
-        await self.send_presence(status=self.client.party.last_raw_status)
+        self._ping_task = asyncio.ensure_future(self.loop_ping())
 
     async def close(self) -> None:
         log.debug('Attempting to close xmpp client')
         if self.xmpp_client.running:
             self.xmpp_client.stop()
 
-            # let the loop run one more time so the xmpp client can stop
             while self.xmpp_client.running:
                 await asyncio.sleep(0)
 
@@ -1100,7 +1411,6 @@ class XMPPClient:
         self.stream = None
         self.muc_service = None
         log.debug('Successfully closed xmpp client')
-        self.client.dispatch_event('xmpp_session_close')
 
         # let loop run one iteration for events to be dispatched
         await asyncio.sleep(0)
@@ -1116,13 +1426,13 @@ class XMPPClient:
         party = self.client.party
 
         if (user_id == self.client.user.id or member.nick is None
-                or user_id not in party.members):
+                or user_id not in party._members):
             return
 
         self.client.dispatch_event('party_message', PartyMessage(
             client=self.client,
             party=party,
-            author=party.members[member.direct_jid.localpart],
+            author=party._members[member.direct_jid.localpart],
             content=message.body.any()
         ))
 
@@ -1138,7 +1448,7 @@ class XMPPClient:
                      muc_reason: str,
                      **kwargs: Any) -> None:
         if muc_leave_mode is aioxmpp.muc.LeaveMode.BANNED:
-            mem = self.client.party.members[member.direct_jid.localpart]
+            mem = self.client.party._members[member.direct_jid.localpart]
             self.client.dispatch_event('party_member_chatban',
                                        mem,
                                        muc_reason)
@@ -1147,7 +1457,7 @@ class XMPPClient:
         muc_jid = aioxmpp.JID.fromstr(
             'Party-{}@muc.prod.ol.epicgames.com'.format(party_id)
         )
-        nick = '{0}:{0}:{1}'.format(
+        nick = '{0}:{1}:{2}'.format(
             self._remove_illegal_characters(self.client.user.display_name),
             self.client.user.id,
             self.xmpp_client.local_jid.resource
@@ -1164,7 +1474,7 @@ class XMPPClient:
         room.on_leave.connect(self.muc_on_leave)
         self.muc_room = room
 
-        asyncio.ensure_future(fut, loop=self.client.loop)
+        asyncio.ensure_future(fut)
         await self.client.wait_for('muc_enter')
 
     async def leave_muc(self) -> None:
@@ -1206,24 +1516,24 @@ class XMPPClient:
         msg.body[None] = content
         await self.stream.send(msg)
 
-    def set_presence(self, status: Optional[Union[str, dict]] = None) -> None:
+    def set_presence(self, *,
+                     status: Optional[Union[str, dict]] = None,
+                     show: Optional[str]) -> None:
         if status is None:
             self.xmpp_client.presence = aioxmpp.PresenceState(available=True)
 
-        elif isinstance(status, dict):
-            self.xmpp_client.set_presence(
-                aioxmpp.PresenceState(available=True),
-                json.dumps(status),
-            )
-
-        else:
-            self.xmpp_client.set_presence(
-                aioxmpp.PresenceState(available=True),
-                json.dumps({'Status': status}),
-            )
+        _status = status if isinstance(status, dict) else {'Status': status}
+        self.xmpp_client.set_presence(
+            state=aioxmpp.PresenceState(
+                available=True,
+                show=show
+            ),
+            status=json.dumps(_status)
+        )
 
     async def send_presence(self, to: Optional[aioxmpp.JID] = None,
-                            status: Optional[Union[str, dict]] = None) -> None:
+                            status: Optional[Union[str, dict]] = None,
+                            show: Optional[str] = None) -> None:
         _status = {}
         if status is None:
             _status = None
@@ -1234,7 +1544,11 @@ class XMPPClient:
         else:
             raise TypeError('status must be None, str or dict')
 
-        pres = aioxmpp.Presence(type_=aioxmpp.PresenceType.AVAILABLE, to=to)
+        pres = aioxmpp.Presence(
+            type_=aioxmpp.PresenceType.AVAILABLE,
+            show=aioxmpp.PresenceShow(show),
+            to=to,
+        )
 
         if _status is not None:
             pres.status[None] = json.dumps(_status)

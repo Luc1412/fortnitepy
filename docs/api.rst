@@ -33,6 +33,8 @@ how you can set up this auth with file storage for the preferred login which is 
 Client
 ------
 
+.. attributetable:: Client
+
 .. autoclass:: Client
     :members:
 
@@ -124,8 +126,14 @@ Enumerations
 
 	.. attribute:: WINDOWS
 	.. attribute:: MAC
-	.. attribute:: PLAYSTATION
-	.. attribute:: XBOX
+	.. attribute:: PLAYSTATION_4
+
+		Also accessible under ``PLAYSTATION`` for legacy reasons.
+	.. attribute:: PLAYSTATION_5
+	.. attribute:: XBOX_ONE
+
+		Also accessible under ``XBOX`` for legacy reasons.
+	.. attribute:: XBOX_X
 	.. attribute:: SWITCH
 	.. attribute:: IOS
 	.. attribute:: ANDROID
@@ -139,7 +147,7 @@ Enumerations
 	.. attribute:: SITTING_OUT
 
 
-.. class:: ProfileSearchPlatform
+.. class:: UserSearchPlatform
 	..attribute:: EPIC_GAMES
 
 		This represents all platforms that use epic games as account service like PC and Mobile.
@@ -217,6 +225,12 @@ Enumerations
 	.. attribute:: LIME
 	.. attribute:: INDIGO
 
+.. class:: StatsCollectionType
+
+	An enumeration for stats collection types.
+
+	.. attribute:: FISH
+
 .. _fortnitepy-api-events:
 
 Event Reference
@@ -237,13 +251,25 @@ this decorator if you are in a subclass of :class:`Client`.
 
         This event is not called when the client starts in :class:`Client.close()`.
 
-.. function:: event_close()
+.. function:: event_before_start()
 
-	This event is called when the client is beginning to log out. 
+	This event is called and waited for before the client starts.
 
 	.. warning::
 
-        This event is not called when the client logs out in :class:`Client.close()`.
+        This event is not called when the client starts in :class:`Client.restart()`.
+
+	.. note::
+
+		This event behaves differently from the other events. The client will wait until the event handlers for this event is finished processing before actually closing. This makes it so you are able to do heavy and/or time consuming operations before the client fully logs out. This unfortunately also means that this event is not compatible with :meth:`Client.wait_for()`.
+
+.. function:: event_before_close()
+
+	This event is called when the client is beginning to log out. This event also exists under the name ``event_close()`` for legacy reasons.
+
+	.. warning::
+
+        This event is not called when the client logs out in :class:`Client.restart()`.
 
 	.. note::
 
@@ -252,6 +278,18 @@ this decorator if you are in a subclass of :class:`Client`.
 .. function:: event_restart()
 
 	This event is called when the client has successfully restarted.
+
+.. function:: event_xmpp_session_establish()
+
+	Called whenever a xmpp session has been established. This can be called multiple times.
+
+.. function:: event_xmpp_session_lost()
+
+	Called whenever the xmpp connection is lost. This can happen when the internet connection is lost or if epics services goes down.
+
+.. function:: event_xmpp_session_close()
+
+	Called whenever the xmpp connection is closed. This means that it is called both when it's lost or closed gracefully.
 	
 .. function:: event_device_auth_generate(details, email)
 
@@ -342,12 +380,12 @@ this decorator if you are in a subclass of :class:`Client`.
 	:param invitation: Invitation object.
 	:type invitation: :class:`ReceivedPartyInvitation`
 
-.. function:: event_party_member_expire(member)
+.. function:: event_invalid_party_invite(friend)
 
-	This event is called when a partymember expires.
-	
-	:param member: Expired member.
-	:type member: :class:`PartyMember`
+	This event is called whenever you received an invite that was invalid. Usually this is because the invite was from a private party you have been kicked from.
+
+	:param friend: The friend that invited you.
+	:type friend: :class:`Friend`
 	
 .. function:: event_party_member_promote(old_leader, new_leader)
 
@@ -365,11 +403,25 @@ this decorator if you are in a subclass of :class:`Client`.
 	:param member: The member that was kicked.
 	:type member: :class:`PartyMember`
 
-.. function:: event_party_member_disconnect(member)
+.. function:: event_party_member_zombie(member)
 
-	This event is called when a member disconnects from the party.
+	This event is called when a members connection was lost and therefore entered a zombie state waiting for their offline time to live expires. If the connection is restored before timing out, :func:`event_party_member_reconnect()` is called. If not then :func:`event_party_member_expire()` is called when their time to live runs out.
 
-	:param member: The member that disconnected.
+	:param member: The member that lost its connection.
+	:type member: :class:`PartyMember`
+
+.. function:: event_party_member_reconnect(member)
+
+	This event is called when a member reconnects after losing their connection.
+
+	:param member: The member that reconnected.
+	:type member: :class:`PartyMember`
+
+.. function:: event_party_member_expire(member)
+
+	This event is called when a member expires after being in their zombie state for 30 seconds.
+	
+	:param member: The member that expired.
 	:type member: :class:`PartyMember`
 
 .. function:: event_party_update(party)
@@ -606,6 +658,28 @@ this decorator if you are in a subclass of :class:`Client`.
 	:param after: The current battlepass data. Same structure as :attr:`PartyMember.battlepass_info`.
 	:type after: :class:`tuple`
 
+.. function:: event_party_member_enlightenments_change(member, before, after)
+
+	This event is called when a members enlightenments values are changed.
+
+	:param member: The member that changed.
+	:type member: :class:`PartyMember`
+	:param before: The previous enlightenment values.
+	:type before: :class:`list`
+	:param after: The current enlightenment values.
+	:type after: :class:`list`
+
+.. function:: event_party_member_corruption_change(member, before, after)
+
+	This event is called when a members corruption value is changed.
+
+	:param member: The member that changed.
+	:type member: :class:`PartyMember`
+	:param before: The previous corruption value. Could be ``None`` if not set.
+	:type before: Optional[:class:`list`]
+	:param after: The current corruption value. Could be ``None`` if not set.
+	:type after: Optional[:class:`list`]
+
 .. function:: event_party_member_outfit_variants_change(member, before, after)
 
 	This event is called when a members outfit variants been changed.
@@ -740,7 +814,7 @@ Stats
 	  'lastmodified': datetime.datetime,
 	}
 
-**Default Squads Gamemode (defaultsquads)**
+**Default Squads Gamemode (defaultsquad)**
 
 .. code-block:: python3
 
@@ -767,6 +841,8 @@ Fortnite Models
 ClientUser
 ~~~~~~~~~~
 
+.. attributetable:: ClientUser
+
 .. autoclass:: ClientUser()
 	:members:
 	:inherited-members:
@@ -774,11 +850,15 @@ ClientUser
 ExternalAuth
 ~~~~~~~~~~~~
 
+.. attributetable:: ExternalAuth
+
 .. autoclass:: ExternalAuth()
 	:members:
 
 User
 ~~~~
+
+.. attributetable:: User
 
 .. autoclass:: User()
 	:members:
@@ -787,19 +867,25 @@ User
 BlockedUser
 ~~~~~~~~~~~
 
+.. attributetable:: BlockedUser
+
 .. autoclass:: BlockedUser()
 	:members:
 	:inherited-members:
 
-ProfileSearchEntryUser
+UserSearchEntry
 ~~~~~~~~~~~
 
-.. autoclass:: ProfileSearchEntryUser()
+.. attributetable:: UserSearchEntry
+
+.. autoclass:: UserSearchEntry()
 	:members:
 	:inherited-members:
 
 SacSearchEntryUser
 ~~~~~~~~~~~
+
+.. attributetable:: SacSearchEntryUser
 
 .. autoclass:: SacSearchEntryUser()
 	:members:
@@ -808,12 +894,16 @@ SacSearchEntryUser
 Friend
 ~~~~~~
 
+.. attributetable:: Friend
+
 .. autoclass:: Friend()
 	:members:
 	:inherited-members:
 
 IncomingPendingFriend
 ~~~~~~~~~~~~~
+
+.. attributetable:: IncomingPendingFriend
 
 .. autoclass:: IncomingPendingFriend()
 	:members:
@@ -822,12 +912,16 @@ IncomingPendingFriend
 OutgoingPendingFriend
 ~~~~~~~~~~~~~
 
+.. attributetable:: OutgoingPendingFriend
+
 .. autoclass:: OutgoingPendingFriend()
 	:members:
 	:inherited-members:
 
 FriendMessage
 ~~~~~~~~~~~~~
+
+.. attributetable:: FriendMessage
 
 .. autoclass:: FriendMessage()
 	:members:
@@ -836,12 +930,16 @@ FriendMessage
 PartyMessage
 ~~~~~~~~~~~~
 
+.. attributetable:: PartyMessage
+
 .. autoclass:: PartyMessage()
 	:members:
 	:inherited-members:
 
 PartyMember
 ~~~~~~~~~~~
+
+.. attributetable:: PartyMember
 
 .. autoclass:: PartyMember()
 	:members:
@@ -850,6 +948,8 @@ PartyMember
 ClientPartyMember
 ~~~~~~~~~~~~~~~~~
 
+.. attributetable:: ClientPartyMember
+
 .. autoclass:: ClientPartyMember()
 	:members:
 	:inherited-members:
@@ -857,11 +957,15 @@ ClientPartyMember
 JustChattingClientPartyMember
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+.. attributetable:: JustChattingClientPartyMember
+
 .. autoclass:: JustChattingClientPartyMember
 	:members:
 
 Party
 ~~~~~
+
+.. attributetable:: Party
 
 .. autoclass:: Party()
 	:members:
@@ -870,6 +974,8 @@ Party
 ClientParty
 ~~~~~~~~~~~
 
+.. attributetable:: ClientParty
+
 .. autoclass:: ClientParty()
 	:members:
 	:inherited-members:
@@ -877,11 +983,15 @@ ClientParty
 ReceivedPartyInvitation
 ~~~~~~~~~~~~~~~~~~~~~~~
 
+.. attributetable:: ReceivedPartyInvitation
+
 .. autoclass:: ReceivedPartyInvitation()
 	:members:
 
 SentPartyInvitation
 ~~~~~~~~~~~~~~~~~~~
+
+.. attributetable:: SentPartyInvitation
 
 .. autoclass:: SentPartyInvitation()
 	:members:
@@ -889,11 +999,15 @@ SentPartyInvitation
 PartyJoinConfirmation
 ~~~~~~~~~~~~~~~~~~~~~
 
+.. attributetable:: PartyJoinConfirmation
+
 .. autoclass:: PartyJoinConfirmation()
 	:members:
 
 Presence
 ~~~~~~~~
+
+.. attributetable:: Presence
 
 .. autoclass:: Presence()
 	:members:
@@ -901,11 +1015,15 @@ Presence
 PresenceParty
 ~~~~~~~~~~~~~
 
+.. attributetable:: PresenceParty
+
 .. autoclass:: PresenceParty()
 	:members:
 
 PresenceGameplayStats
 ~~~~~~~~~~~~~~~~~~~~~
+
+.. attributetable:: PresenceGameplayStats
 
 .. autoclass:: PresenceGameplayStats()
 	:members:
@@ -913,11 +1031,23 @@ PresenceGameplayStats
 StatsV2
 ~~~~~~~
 
+.. attributetable:: StatsV2
+
 .. autoclass:: StatsV2()
+	:members:
+
+StatsCollection
+~~~~~~~~~~~~~~~
+
+.. attributetable:: StatsCollection
+
+.. autoclass:: StatsCollection()
 	:members:
 
 BattleRoyaleNewsPost
 ~~~~~~~~~~~~~~~~~~~~
+
+.. attributetable:: BattleRoyaleNewsPost
 
 .. autoclass:: BattleRoyaleNewsPost()
 	:members:
@@ -925,11 +1055,15 @@ BattleRoyaleNewsPost
 Store
 ~~~~~
 
+.. attributetable:: Store
+
 .. autoclass:: Store()
 	:members:
 
 FeaturedStoreItem
 ~~~~~~~~~~~~~~~~~
+
+.. attributetable:: FeaturedStoreItem
 
 .. autoclass:: FeaturedStoreItem()
 	:members:
@@ -938,12 +1072,16 @@ FeaturedStoreItem
 DailyStoreItem
 ~~~~~~~~~~~~~~
 
+.. attributetable:: DailyStoreItem
+
 .. autoclass:: DailyStoreItem()
 	:members:
 	:inherited-members:
 
 Playlist
 ~~~~~~~~
+
+.. attributetable:: Playlist
 
 .. autoclass:: Playlist()
 	:members:
@@ -954,11 +1092,40 @@ Data Classes
 
 Data classes used as data containers in the library.
 
+DefaultPartyConfig
+~~~~~~~~~~~~~~~~~~
+
+.. attributetable:: DefaultPartyConfig
+
 .. autoclass:: DefaultPartyConfig()
 	:members:
 
+DefaultPartyMemberConfig
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. attributetable:: DefaultPartyMemberConfig
+
 .. autoclass:: DefaultPartyMemberConfig()
 	:members:
+
+HTTPRetryConfig
+~~~~~~~~~~~~~~~
+
+.. autoclass:: HTTPRetryConfig()
+	:members:
+
+Route
+~~~~~
+
+.. attributetable:: Route
+
+.. autoclass:: Route()
+	:members:
+
+Avatar
+~~~~~~
+
+.. attributetable:: Avatar
 
 .. autoclass:: Avatar()
 	:members:
@@ -975,8 +1142,6 @@ Exceptions
 
 .. autoexception:: ValidationFailure
 
-.. autoexception:: PurchaseException
-
 .. autoexception:: EventError
 
 .. autoexception:: XMPPError
@@ -990,3 +1155,9 @@ Exceptions
 .. autoexception:: DuplicateFriendship
 
 .. autoexception:: FriendshipRequestAlreadySent
+
+.. autoexception:: MaxFriendshipsExceeded
+
+.. autoexception:: InviteeMaxFriendshipsExceeded
+
+.. autoexception:: InviteeMaxFriendshipRequestsExceeded

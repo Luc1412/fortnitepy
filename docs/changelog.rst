@@ -6,6 +6,356 @@ Changelog
 Detailed version changes.
 
 
+v3.3.4
+------
+
+Fixed typo in the :attr:`Platform.XBOX_X` value. Whoops.
+
+
+v3.3.3
+------
+
+Added
+~~~~~
+
+- Added :attr:`Platform.XBOX_X`
+- Added :attr:`Platform.PLAYSTATION_5`
+
+
+v3.3.2
+------
+
+Hotpatch to fix parties showing as outdated after the Fortnite v14.50 update.
+
+Added
+~~~~~
+
+- Added kwarg ``party_version`` to :class:`Client` so that a custom party version can be set.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed parties showing as outdated.
+
+
+v3.3.1
+------
+
+Small patch to fix a problem with bots showing as offline when added as a friend.
+
+Big Fixes
+~~~~~~~~~
+
+- Fixed an issue that caused bots to appear as offline when being added by a new friend.
+- Fixed an error in the processing of :attr:`PartyMember.corruption` that often resulted in huge error spams.
+- :meth:`Client.set_presence()` now also correctly saves the away status.
+- Fixed a rare error in the processing of html errors being returned from graphql services.
+
+
+v3.3.0
+------
+
+Changed
+~~~~~~~
+
+- Changes made to :meth:`PartyMember.create_variant`:
+    - (Renamed) `PartyMember.create_variants` -> :meth:`PartyMember.create_variant`. This is not breaking though as its aliased to its old name.
+    - (**Breaking**) Removed kwarg ``particle_config`` in favor of the new ``config_overrides``.
+- Updated build version to fortnite v14.10.
+
+Added
+~~~~~
+
+- Added :attr:`PartyMember.corruption`.
+- Added kwarg ``corruption`` to :meth:`ClientPartyMember.set_outfit()` and :meth:`ClientPartyMember.set_backpack`.
+- Added event :func:`event_party_member_enlightenments_change()`.
+- Added event :func:`event_party_member_corruption_change()`.
+- Added alias ``abort()`` for :meth:`OutgoingPendingFriend.cancel()`.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed variants not working after fortnite v14.10.
+- Fixed outdated lobby errors when the bot was leader.
+- Fixed an issue that caused :meth:`Client.get_outgoing_pending_friend()` and :meth:`Client.get_incoming_pending_friend()` to error when it should have return ``None``.
+- Fixed a rare race condition issue that could break processing of :func:`event_friend_request_abort()` and :func:`event_friend_request_decline()`
+
+
+v3.2.0
+------
+
+Changed
+~~~~~~~
+
+- (**Breaking**) Reworked :meth:`Client.fetch_multiple_battlepass_levels()` and other methods related to battlepass levels.
+    - They now require a season number to be specified.
+    - They now return :class:`float` instead of :class:`int`. You no longer have to divide the value yourself by 100.
+- (**Breaking**) :meth:`Client.add_friend()` now raises more specific errors when friendship limits has been exceeded.
+- (**Breaking**) :attr:`HTTPException.message_vars` is now always a list.
+- :meth:`ReceivedPartyInvitation.accept()` now returns the newly joined :class:`ClientParty`.
+
+Added
+~~~~~
+
+- Added :meth:`Client.fetch_multiple_br_stats_collections()`.
+- Added :meth:`User.fetch_br_stats_collection()`.
+- Added enum :class:`StatsCollectionType`.
+- Added :class:`StatsCollection`.
+- Added :attr:`HTTPException.route`.
+- Added :meth:`User.add()`.
+- Added three new errors related to friend limits:
+    - :exc:`MaxFriendshipsExceeded`
+    - :exc:`InviteeMaxFriendshipsExceeded`
+    - :exc:`InviteeMaxFriendshipRequestsExceeded`
+- Exposed :class:`Route` and documented it.
+- Added following classmethods to all enumerations:
+    - ``get_random_member()``
+    - ``get_random_name()``
+    - ``get_random_value()``
+- Added :attr:`SeasonStartTimestamp.SEASON_14` and :attr:`SeasonEndTimestamp.SEASON_13`
+
+Removed
+~~~~~~~
+
+- Removed `Client.remove_all_friends()` as it had been deprecated by epic.
+- Removed the undocumented attribute ``HTTPClient.session``.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed a rare race condition causing the clients party member object to be missing.
+- Fixed an issue introduced in the last update which caused season timestamps to be a little incorrect. Fetching battlepass levels was sometimes affected by this issue.
+- Fixed an issue that caused the http client to retry a request one too many times.
+- Fixed an issue where some graphql requests would error on 500 statuses instead of retrying.
+
+Docs
+~~~~
+
+- Added attribute tables for most models and dataclasses where it makes sense.
+- Added source links for methods and classes.
+- Changed the font used and cleaned up some other stuff a little.
+
+
+v3.1.0
+------
+
+Changed
+~~~~~~~
+
+- Renamed ``event_close()`` -> :func:`event_before_close()`. This isn't a breaking change though as it still exists under ``event_close()``.
+- Renamed ``PresenceGameplayStats.num_kills`` -> :attr:`PresenceGameplayStats.kills` but an alias still exist under the old name.
+- The client now reconnects to its last known party on auth refresh.
+- [:ref:`Ext Commands <fortnitepy_ext_commands>`] :class:`ext.commands.Group` now inherits ``case_insensitive`` if not explicitly specified.
+
+Added
+~~~~~
+
+- Added :func:`event_before_start()`.
+- Added ``before_start`` and ``before_close`` kwargs to :func:`run_multiple()`.
+- Added :meth:`Friend.wait_until_online()`.
+- Added :meth:`Friend.wait_until_offline()`.
+- [:ref:`Ext Commands <fortnitepy_ext_commands>`] Added :attr:`ext.commands.GroupMixin.qualified_case_insensitive` to get the defining ``case_insensitive`` value.
+
+Bug Fixes
+~~~~~~~~~
+
+- :func:`event_before_close()` now does not break the logout if an error was raised in the callback.
+- Fixed fetching battlepass levels for season 13.
+- Fixed an issue where :exc:`HTTPException`\s could hypothetically in some rare cases be incorrect.
+- Fixed exponential backoff retries not working because of a typo (oops).
+- Fixed a race condition that caused the clients party member to not always equip its default meta.
+- Silenced a noisy error raised by aioxmpp on connection lost.
+- Fixed a crash on start caused by the special unallowed characters in the clients display name (for good this time).
+- Fixed an error raised in the processing of :func:`event_party_member_zombie()` if the client was not fully started.
+- The client now has a correct multi user chat nick (not that it really matters).
+
+
+v3.0.2
+------
+
+Another quick hotpatch.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed `TypeError: _request() got an unexpected keyword argument 'config'`.
+
+
+v3.0.1
+------
+
+Quick hotpatch.
+
+Changes
+~~~~~~~
+
+- (**Breaking**) :meth:`Client.fetch_party()` now returns ``None`` instead of raising an error if not found.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed :func:`event_party_member_kick()` (oops).
+- Fixed a small race condition issue regarding party reconnect.
+
+
+v3.0.0
+------
+
+This major update focuses on stability but also introduces lots of additions and changes.
+
+Changed
+~~~~~~~
+
+- (**Breaking**) Renamed ``ProfileSearchPlatform`` -> :class:`UserSearchPlatform`.
+- (**Breaking**) Renamed ``ProfileSearchEntryUser`` -> :class:`UserSearchEntry`.
+- (**Breaking**) The access attribute for caches now return a copied list of the caches values. This affects these attributes:
+    - :attr:`Client.friends`
+    - :attr:`Client.pending_friends`
+    - :attr:`Client.blocked_users`
+    - :attr:`Client.presences`
+    - :attr:`Party.members`
+- (**Breaking**) Renamed ``Client.join_to_party()`` -> :meth:`Client.join_party()`.
+- (**Breaking**) Renamed ``Client.set_status()`` -> :meth:`Client.set_presence()`.
+- (**Breaking**) Renamed ``Client.send_status()`` -> :meth:`Client.send_presence()`.
+- (**Breaking**) Renamed ``event_party_member_disconnect()`` -> :func:`event_party_member_zombie()`.
+- Renamed multiple fetch methods. All of the renamed methods are still aliased to their previous names so this should break anything.
+    - ``Client.fetch_profile_by_display_name()`` -> :meth:`Client.fetch_user_by_display_name()`.
+    - ``Client.fetch_profiles_by_display_name()`` -> :meth:`Client.fetch_users_by_display_name()`.
+    - ``Client.fetch_profile()`` -> :meth:`Client.fetch_user()`.
+    - ``Client.fetch_profiles()`` -> :meth:`Client.fetch_users()`.
+    - ``Client.fetch_profile_by_email()`` -> :meth:`Client.fetch_user_by_email()`.
+    - ``Client.search_profiles()`` -> :meth:`Client.search_users()`.
+- Removed usage of the loop parameter internally since asyncio is deprecating it soon.
+- The client now logs out and returns the start call (:meth:`Client.start()` or :meth:`Client.run()`) when too many reauth attempts has been tried. This happens even if the client has previously successfully logged in and emitted :func:`event_ready()`.
+
+Added
+~~~~~
+
+- Added parameter ``error_callback`` to :func:`start_multiple()` and :func:`run_multiple()`.
+- Added parameter ``away`` to :class:`Client` to set the clients presence :class:`AwayStatus`.
+- Added proper ratelimit and retry handling for http requests.
+- Added parameter ``http_retry_config`` to :class:`Client` which controls how http ratelimits and retries are handled. Check out its new dataclass :class:`HTTPRetryConfig` to see the options you can set.
+- Added :attr:`Client.incoming_pending_friends` to get a list of the clients incoming pending friends.
+- Added :attr:`Client.outgoing_pending_friends` to get a list of the clients outgoing pending friends.
+- Added :meth:`Client.get_incoming_pending_friend()` to get an incoming pending friend by their id.
+- Added :meth:`Client.get_outgoing_pending_friend()` to get an outgoing pending friend by their id.
+- Added :meth:`Client.wait_until_closed()`.
+- Added :meth:`Client.fetch_party()` to fetch a party by its id.
+- Added parameter ``away`` to :meth:`Client.set_presence()` and :meth:`Client.send_presence()`.
+- Added :attr:`HTTPException.request_headers` to access the headers of the request that failed.
+- Added alias ``inbound`` for attribute ``incoming`` to :class:`IncomingPendingFriend` and :class:`OutgoingPendingFriend`.
+- Added alias ``outbound`` for attribute ``outgoing`` to :class:`IncomingPendingFriend` and :class:`OutgoingPendingFriend`.
+- Added parameter ``offline_ttl`` to :class:`DefaultPartyMemberConfig`.
+- Added :attr:`PartyMember.offline_ttl` to check a members time to live seconds before leaving the party when its connection is lost.
+- Added :meth:`PartyMember.is_zombie()` to check if the members connection is currently lost and therefore not responding.
+- Added :attr:`PartyMember.zombie_since` to check when a member lost its connection.
+- Added :meth:`Party.join()`.
+- Added :meth:`ClientParty.set_max_size()` to set the max size of the party while in it.
+- Added :func:`event_invalid_party_invite()`.
+- Added :func:`event_party_member_reconnect()`.
+- Added :func:`event_xmpp_session_establish()`.
+- Added :func:`event_xmpp_session_lost()`.
+- Added :func:`event_xmpp_session_close()`.
+- Added compare magic methods (``__eq__`` and ``__ne__``) to:
+    - :class:`Avatar`
+    - :class:`Party`
+    - :class:`ClientParty`
+    - :class:`ReceivedPartyInvitation`
+    - :class:`SentPartyInvitation`
+    - :class:`PartyJoinConfirmation`
+    - :class:`Playlist`
+    - :class:`ExternalAuth`
+    - :class:`User`
+    - :class:`BlockedUser`
+    - :class:`UserSearchEntry`
+    - :class:`SacSearchEntryUser`
+    - :class:`User`
+    - :class:`Friend`
+    - :class:`IncomingPendingFriend`
+    - :class:`OutgoingPendingFriend`
+    - :class:`PartyMember`
+
+Removed
+~~~~~~~
+
+- Removed parameter ``check_private`` from :meth:`Client.join_party()`.
+
+Bug Fixes
+~~~~~~~~~
+
+- Reworked the invalid access token reauth strategy to fix multiple issues that caused stuff to break down completely.
+- Fixed an issue regarding joining a bots party when the bot was party leader but not the original creator.
+- Fixed party config patching.
+- Fixed an issue where bots were not able to join any new lobbies in some rare circumstances.
+- Fixed an issue that caused other users to not be able to rejoin or lookup the bots private party even when the user had already been a part of the party before.
+- Fixed an issue where :exc:`HTTPException` would sometimes fail at initializing because of a missing required value.
+- Fixed multiple issues regarding graphql error responses that was not correctly catched to raise an :exc:`HTTPException` and would raise an ugly error.
+- HTTP retries are now attempted for even more errors.
+- Fixed an issue where :attr:`PartyMember.connection` wasn't always updated to use the latest connection.
+- Improved the clients knowledge of which member is actually the party leader.
+- Fixed and improved lots of stuff regarding sudden connection loss including recovering and dispatching events, automatic party reconnect if the criterias is met and more.
+- Fixed an issue where a member was removed from the party internally if their connection was lost but not expired.
+- Lowered the deadtime hard limit values for the xmpp connection before reconnecting.
+- Fixed a window where :attr:`ClientParty.me` could be ``None``.
+
+
+v2.3.1
+------
+
+Stability improvements.
+
+Changed
+~~~~~~~
+
+- Dropped the underlying launcher session since it's not longer used for anything.
+- Authentication now attempts to reauthenticate on startup in some cases.
+- Reauthentication on sudden access token invalid has been improved.
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed some issues with incorrect handling of websocket disconnects that resulted in the xmpp connection to eventually time out.
+- A graceful close is now attempted even if the client is not ready.
+- Processing of messages now handles some race conditions that some times resulted in :attr:`FriendMessage.author` being ``None``.
+
+
+v2.3.0
+------
+
+Huge performance improvements and lots of bug fixes.
+
+Changed
+~~~~~~~
+
+- Internal parsing of xmpp stanzas like presences and messages are now processed by a custom processor which bypasses aioxmpp's slow processing whenever possible. This is more noticable on accounts with lots of online friends. Internal tests are showing performance speeds to be more than three times faster than before.
+
+Added
+~~~~~
+
+- Added missing docs for ``connector`` keyword argument in :class:`Client.`
+- Added keyword argument ``ws_connector`` to :class:`Client`.
+- Added ``__slots__`` to :class:`Avatar`.
+
+Removed
+~~~~~~~
+
+- Removed two undocumented attributes related to presences to reduce memory footprint:
+    - ``Presence.raw_properties``
+    - ``PresenceParty.raw``
+
+Bug Fixes
+~~~~~~~~~
+
+- Fixed lots of issues regarding the xmpp over websocket solution. The most noticable one is that xmpp will auto reconnect on errors and unexpected closings.
+- Fixed invalid refresh token sometimes crashing the bot while refreshing the session. NOTE: This only works when using :class:`DeviceAuth` or :class:`AdvancedAuth`.
+- Fixed an issue where stored meta changes from :attr:`DefaultPartyConfig.meta` wasn't always applied correctly when creating a new party.
+- Fixed an issue where some meta props wasn't always updated when using :meth:`ClientParty.edit()` or :meth:`ClientPartyMember.edit()`.
+- :class:`aiohttp.BaseConnector`'s passed to :class:`Client` will no longer be closed when the client is closed.
+- Fixed :attr:`PartyMember.external_auths` always being empty when the member was a part of :class:`ClientParty`.
+- Fixed an issue that caused the client to sometimes leave the party some seconds after joining due to an event not being fired.
+- The client will no longer send out its presence two times on startup. Sowwy epic :(
+
+
 v2.2.1
 ------
 
